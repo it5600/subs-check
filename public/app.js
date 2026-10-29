@@ -18,6 +18,26 @@
 (function () {
   'use strict';
 
+  // ===== API 基址解析 =====
+  // 部署形态有两种：
+  //   1) 独立 TCP 模式 — 页面位于 http://<host>:<port>/，API 即 /api/xxx
+  //   2) fnOS 统一网关模式 — 页面位于 /app/<appname>/，API 为 /app/<appname>/api/xxx
+  // 这里从当前页面路径推导基址，使同一份前端在两种模式下都可用。
+  const API_BASE = (function resolveApiBase() {
+    // 去掉文件名与查询串，只保留目录部分
+    const path = window.location.pathname || '/';
+    const dir = path.endsWith('/') ? path : path.slice(0, path.lastIndexOf('/') + 1);
+    // 网关模式下目录形如 /app/<appname>/；独立模式为 /
+    const m = dir.match(/^\/app\/[^/]+\/?$/);
+    return m ? dir.replace(/\/$/, '') : '';
+  })();
+
+  /** 为 API 路径补全基址前缀 */
+  function apiUrl(path) {
+    if (!path.startsWith('/')) return API_BASE + '/' + path;
+    return API_BASE + path;
+  }
+
   // ===== 全局状态 =====
   const state = {
     currentNodes: [],
@@ -103,7 +123,7 @@
      * 获取 CSRF Token
      */
     async getCsrfToken() {
-      const res = await fetch('/api/csrf-token');
+      const res = await fetch(apiUrl('/api/csrf-token'));
       const json = await res.json();
       if (json.code !== 0) throw new Error(json.message);
       state.csrfToken = json.data.csrfToken;
@@ -115,7 +135,7 @@
      */
     async login(apiKey) {
       await this.getCsrfToken();
-      const res = await fetch('/api/login', {
+      const res = await fetch(apiUrl('/api/login'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -137,7 +157,7 @@
     async logout() {
       try {
         const token = state.csrfToken || await this.getCsrfToken();
-        await fetch('/api/logout', {
+        await fetch(apiUrl('/api/logout'), {
           method: 'POST',
           headers: { 'X-CSRF-Token': token },
           credentials: 'same-origin',
@@ -161,7 +181,7 @@
       const opts = { method, headers, credentials: 'same-origin' };
       if (body) opts.body = JSON.stringify(body);
 
-      const res = await fetch(path, opts);
+      const res = await fetch(apiUrl(path), opts);
       const json = await res.json();
 
       if (json.code === 403003 && retry) {

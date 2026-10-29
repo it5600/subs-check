@@ -44,16 +44,32 @@ func (app *App) loadConfig() error {
 	return nil
 }
 
+// createDefaultConfig writes the built-in configuration template when no
+// config file exists yet.
+//
+// Upstream subs-check exits the process here (os.Exit(0)) so the user edits
+// the file before the first run. That behaviour is wrong for the merged
+// application: in FPK/Docker deployments the config lives in a shared volume
+// and the process is restarted by a supervisor, so exiting would make the
+// app permanently fail to start.
+//
+// Instead the template is written, loaded into GlobalConfig and the run
+// continues with the default values.
 func (app *App) createDefaultConfig() error {
 	slog.Info("配置文件不存在，创建默认配置文件")
 
 	if err := os.WriteFile(app.configPath, []byte(config.DefaultConfigTemplate), 0644); err != nil {
 		return fmt.Errorf("写入默认配置文件失败: %w", err)
 	}
-
 	slog.Info("默认配置文件创建成功")
-	slog.Info(fmt.Sprintf("请编辑配置文件: %s", app.configPath))
-	os.Exit(0)
+	slog.Info(fmt.Sprintf("配置文件路径: %s", app.configPath))
+
+	// Load the freshly written template so the run continues with valid values.
+	if err := yaml.Unmarshal(config.DefaultConfigTemplate, config.GlobalConfig); err != nil {
+		return fmt.Errorf("解析默认配置文件失败: %w", err)
+	}
+
+	slog.Info("已载入默认配置，可在共享目录中修改后自动生效")
 	return nil
 }
 

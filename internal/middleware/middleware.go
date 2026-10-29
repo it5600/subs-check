@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -133,19 +134,53 @@ func CompareAPIKey(key, apiKey string) bool {
 	return subtle.ConstantTimeCompare([]byte(key), []byte(apiKey)) == 1
 }
 
-// CheckAuth validates authentication via Cookie Session, X-API-Key header, or gateway header.
-// When gatewayMode is true, requests coming through the fnOS unified gateway
-// are trusted (the gateway itself handles authentication and passes user identity
-// via the X-Trim-Userid header).
-func CheckAuth(r *http.Request, apiKey string, sessions *SessionStore, gatewayMode bool) (bool, string) {
-	// 0. Gateway mode: fnOS unified gateway already authenticated the user
-	if gatewayMode {
-		// The gateway injects X-Trim-Userid for authenticated requests.
-		// A request without this header is unauthenticated (e.g. direct socket access).
-		if uid := r.Header.Get("X-Trim-Userid"); uid != "" {
-			return true, "gateway"
-		}
+// GatewayUser holds the trusted identity injected by the fnOS unified gateway.
+//
+// The gateway only proves that the request came from an authenticated NAS
+// session; it does not prove the caller has any particular business
+// privilege. Callers must therefore check IsAdmin themselves before exposing
+// management features.
+type GatewayUser struct {
+	UID      int64
+	IsAdmin  bool
+	Username string
+}
+
+// ParseGatewayIdentity reads the X-Trim-* identity headers injected by the
+// fnOS unified gateway. It returns (nil, false) when the headers are absent,
+// which means the request did not pass through an authenticated gateway
+// (e.g. direct socket access) and must be rejected.
+//
+// The uid is parsed leniently: a malformed header is treated as unauthenticated
+// rather than trusted, matching the gateway contract's "verify before use"
+// rule. Header values are only ever treated as display context, never as an
+// authorization grant on their own.
+func ParseGatewayIdentity(r *http.Request) (*GatewayUser, bool) {
+	uidHeader := r.Header.Get("X-Trim-Userid")
+	if uidHeader == "" {
+		return nil, false
 	}
+	uid, err := strconv.ParseInt(uidHeader, 10, 64)
+	if err != nil || uid <= 0 {
+		return nil, false
+	}
+
+	return &GatewayUser{
+		UID:      uid,
+		IsAdmin:  strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Trim-Isadmin")), "true"),
+		Username: r.Header.Get("X-Trim-Username"),
+	}, true
+}
+
+// CheckAuth validates authentication via Cookie Session or X-API-Key header.
+//
+// NOTE: the fnOS gateway identity is intentionally NOT an authentication
+// shortcut here. The gateway proves the caller is a logged-in NAS user, but
+// the application still needs its own login (or an API key) before handing
+// out management data — otherwise any NAS user could open the panel and
+// read/change subscription sources. Callers that do want to admit gateway
+// users must additionally require IsAdmin via ParseGatewayIdentity.
+func CheckAuth(r *http.Request, apiKey string, sessions *SessionStore) (bool, string) {
 	// 1. Cookie Session
 	cookie, err := r.Cookie("substore_sid")
 	if err == nil && cookie.Value != "" {
@@ -167,6 +202,16 @@ func ApplySecurityHeaders(w http.ResponseWriter, headers map[string]string) {
 	for k, v := range headers {
 		w.Header().Set(k, v)
 	}
+}
+
+// SecurityHeadersHandler wraps a handler and injects the configured security
+// headers into every response. It is the middleware form of
+// ApplySecurityHeaders, suitable for attaching to the root handler chain.
+func SecurityHeadersHandler(headers map[string]string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ApplySecurityHeaders(w, headers)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ===== Request Logging =====

@@ -38,8 +38,16 @@ func New(version string) *App {
 	configPath := flag.String("f", "", "配置文件路径")
 	flag.Parse()
 
+	// The -f flag wins; otherwise fall back to the SUBS_CONFIG_PATH
+	// environment variable so the merged binary can be configured purely
+	// through env vars (as the FPK launcher does).
+	resolved := *configPath
+	if resolved == "" {
+		resolved = os.Getenv("SUBS_CONFIG_PATH")
+	}
+
 	return &App{
-		configPath: *configPath,
+		configPath: resolved,
 		checkChan:  make(chan struct{}),
 		done:       make(chan struct{}),
 		version:    version,

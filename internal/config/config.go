@@ -17,7 +17,6 @@ type Config struct {
 	SocketPath    string // Unix socket path for gateway
 	GatewayPrefix string // e.g. /app/trim.substore-ui-go
 	GatewayMode   bool   // When true, skip API key auth (gateway handles SSO)
-
 	SubsCheckHost string
 	SubsCheckPort int
 
@@ -80,7 +79,7 @@ func Load() *Config {
 
 		SubStoreHost: getEnv("SUB_STORE_HOST", "127.0.0.1"),
 		SubStorePort: getEnvInt("SUB_STORE_PORT", 8299),
-		SubStorePath: getEnv("SUB_STORE_PATH", "/s-7f3K9mQx"),
+		SubStorePath: getEnv("SUB_STORE_PATH", ""),
 
 		ConfigPath: getEnv("SUBS_CONFIG_PATH", "/vol1/1000/Docker/subs-check/config/config.yaml"),
 		PublicDir:  getEnv("PUBLIC_DIR", "./public"),

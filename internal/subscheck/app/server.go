@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -91,8 +92,17 @@ func (a *SubStoreApp) SetupRoutes(router *gin.Engine) error {
 	// Public export
 	router.GET("/export/:target", a.exportHandler)
 
-	// pprof
-	pprof.Register(router)
+	// pprof: profiling endpoints expose process internals (heap dumps, goroutine
+	// stacks, request stats). They are only registered when explicitly enabled
+	// via PPROF_ENABLED=true, and only on a non-gateway listener. Behind the
+	// fnOS gateway the socket is reachable by any process on the host, so
+	// exposing pprof there would leak credentials and internal state.
+	if enablePprof() {
+		pprof.Register(router)
+		slog.Info("pprof 已启用（调试端口）", "路由", "/debug/pprof")
+	} else {
+		slog.Info("pprof 未启用（如需调试请设置 PPROF_ENABLED=true）")
+	}
 
 	// ===== Embedded static and templates =====
 	if scconfig.GlobalConfig.EnableWebUI {
@@ -123,11 +133,11 @@ func (a *SubStoreApp) SetupRoutes(router *gin.Engine) error {
 	api.GET("/csrf-token", a.handleCSRFToken)
 	api.POST("/login", a.handleLogin)
 	api.POST("/logout", a.handleLogout)
-	api.GET("/dashboard", a.handleDashboard)
 
 	// subs-check authed routes (X-API-Key)
 	api.Use(a.authMiddleware(scconfig.GlobalConfig.APIKey))
 	{
+		api.GET("/dashboard", a.handleDashboard)
 		api.GET("/config", a.getConfig)
 		api.POST("/config", a.updateConfig)
 		api.GET("/status", a.getStatus)
@@ -167,9 +177,126 @@ func (a *SubStoreApp) SetupRoutes(router *gin.Engine) error {
 	}
 
 	// ===== substore-ui-go frontend =====
-	router.Static("/", a.cfg.PublicDir)
+	// NOTE: router.Static("/", ...) cannot be used here. Gin expands it to a
+	// catch-all wildcard "/*filepath", which conflicts with the already
+	// registered "/api" group and panics at startup:
+	//   panic: catch-all wildcard '*filepath' in new path '/*filepath'
+	//          conflicts with existing path segment 'a' in existing prefix '/a'
+	// Instead the frontend is served through NoRoute, which only fires for
+	// paths that matched no route — same behaviour, no route-tree conflict.
+	router.NoRoute(a.serveFrontend)
 
 	return nil
+}
+
+// mimeTypes maps file extensions to MIME types for the frontend handler.
+// Package-level to avoid a per-request map allocation.
+var mimeTypes = map[string]string{
+	".html":  "text/html; charset=utf-8",
+	".js":    "application/javascript; charset=utf-8",
+	".css":   "text/css; charset=utf-8",
+	".json":  "application/json; charset=utf-8",
+	".svg":   "image/svg+xml",
+	".png":   "image/png",
+	".jpg":   "image/jpeg",
+	".jpeg":  "image/jpeg",
+	".gif":   "image/gif",
+	".ico":   "image/x-icon",
+	".woff2": "font/woff2",
+	".woff":  "font/woff",
+	".ttf":   "font/ttf",
+	".map":   "application/json; charset=utf-8",
+}
+
+// serveFrontend serves the single-page frontend from PublicDir.
+//
+// It mirrors the behaviour of router.Static("/", dir) — "/" resolves to
+// index.html — while keeping path-traversal protection, ETag support and
+// streaming via http.ServeContent (zero-copy for large bundles).
+func (a *SubStoreApp) serveFrontend(c *gin.Context) {
+	// Only GET/HEAD are meaningful for static assets.
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	publicDir := filepath.Clean(a.cfg.PublicDir)
+
+	// Strip the gateway prefix so the same binary works behind the fnOS
+	// unified gateway (which forwards the prefixed path) and standalone.
+	requestPath := c.Request.URL.Path
+	if prefix := strings.TrimSuffix(a.cfg.GatewayPrefix, "/"); prefix != "" {
+		if requestPath == prefix {
+			requestPath = "/"
+		} else if strings.HasPrefix(requestPath, prefix+"/") {
+			requestPath = strings.TrimPrefix(requestPath, prefix)
+		}
+	}
+
+	relPath := strings.TrimPrefix(requestPath, "/")
+	target := filepath.Join(publicDir, relPath)
+
+	// The root path must serve index.html rather than the directory itself.
+	if relPath == "" {
+		target = filepath.Join(publicDir, "index.html")
+	}
+
+	// Path traversal protection: the resolved path must stay inside publicDir.
+	cleanPublic := filepath.Clean(publicDir)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanPublic, cleanTarget)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+
+	f, err := os.Open(cleanTarget)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Unknown path: fall back to index.html so client-side routing
+			// (hash-based views) keeps working on a hard refresh.
+			f, err = os.Open(filepath.Join(cleanPublic, "index.html"))
+			if err != nil {
+				c.AbortWithStatus(http.StatusNotFound)
+				return
+			}
+			cleanTarget = filepath.Join(cleanPublic, "index.html")
+		} else {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(cleanTarget))
+	mime, ok := mimeTypes[ext]
+	if !ok {
+		mime = "application/octet-stream"
+	}
+
+	// ETag computed from size + modtime — no full file read.
+	etag := fmt.Sprintf(`"%x-%x"`, info.Size(), info.ModTime().UnixNano())
+	w := c.Writer
+	w.Header().Set("Content-Type", mime)
+	if ext == ".html" {
+		w.Header().Set("Cache-Control", "no-cache")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+	}
+	w.Header().Set("ETag", etag)
+
+	if match := c.Request.Header.Get("If-None-Match"); match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	http.ServeContent(w, c.Request, info.Name(), info.ModTime(), f)
 }
 
 // ===== Auth Middleware =====
@@ -187,7 +314,23 @@ func (a *SubStoreApp) authMiddleware(key string) gin.HandlerFunc {
 
 func (a *SubStoreApp) sessionAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		valid, authType := middleware.CheckAuth(c.Request, a.cfg.APIKey, a.handlerApp.Sessions, a.cfg.GatewayMode)
+		// Gateway requests must additionally prove administrator privilege:
+		// the gateway authenticates the NAS user, but the panel is a
+		// management surface that should not be readable by ordinary users.
+		if gwUser, ok := middleware.ParseGatewayIdentity(c.Request); ok {
+			if !gwUser.IsAdmin {
+				a.handlerApp.Stats.IncErrors()
+				c.JSON(http.StatusForbidden, gin.H{"code": 403004, "message": "需要管理员权限"})
+				c.Abort()
+				return
+			}
+			c.Set("gateway_uid", gwUser.UID)
+			c.Set("gateway_username", gwUser.Username)
+			c.Next()
+			return
+		}
+
+		valid, authType := middleware.CheckAuth(c.Request, a.cfg.APIKey, a.handlerApp.Sessions)
 		if !valid {
 			a.handlerApp.Stats.IncErrors()
 			c.JSON(http.StatusUnauthorized, gin.H{"code": 401001, "message": "未授权"})
@@ -207,6 +350,14 @@ func (a *SubStoreApp) sessionAuthMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// enablePprof reports whether profiling endpoints should be registered.
+// Disabled by default so the process does not expose heap dumps and goroutine
+// stacks to whoever can reach the listener.
+func enablePprof() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("PPROF_ENABLED")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 // ===== subs-check API Handlers =====
