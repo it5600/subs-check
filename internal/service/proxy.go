@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"crypto/md5"
+	"errors"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,6 +15,15 @@ import (
 	"time"
 
 	"substore-ui-go/internal/model"
+)
+
+// Sentinel errors for the service package.
+// Wrap with fmt.Errorf("%w", ...) at call sites; check with errors.Is().
+var (
+	ErrUpstreamUnreachable = fmt.Errorf("upstream service unreachable")
+	ErrUpstreamTimeout     = fmt.Errorf("upstream service request timeout")
+	ErrEmptyResponse       = fmt.Errorf("upstream returned empty response body")
+	ErrParseFailure        = fmt.Errorf("failed to parse upstream data")
 )
 
 // hopByHopHeaders are headers that should not be forwarded (RFC 7230 §6.1)
@@ -101,8 +112,10 @@ func ProxyRequest(w http.ResponseWriter, r *http.Request, targetHost string, tar
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 
-	// Create upstream request
-	proxyReq, err := http.NewRequest(r.Method, upstreamURL, r.Body)
+	// Create upstream request with caller's context for cancellation propagation.
+	// Reference: Go blog "Contexts and goroutines in Go" — context should flow
+	// from the inbound request through all downstream calls.
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, FormatError(502001, "代理请求失败: "+err.Error()))
 		return
@@ -142,11 +155,12 @@ func ProxyRequest(w http.ResponseWriter, r *http.Request, targetHost string, tar
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// ProxyGet makes a GET request to the upstream and returns the response body
-func ProxyGet(targetHost string, targetPort int, targetPath string, apiKey string) (int, []byte, error) {
+// ProxyGet makes a GET request to the upstream and returns the response body.
+// The caller's context is propagated so cancellation/timeout reaches the upstream.
+func ProxyGet(ctx context.Context, targetHost string, targetPort int, targetPath string, apiKey string) (int, []byte, error) {
 	upstreamURL := fmt.Sprintf("http://%s:%d%s", targetHost, targetPort, targetPath)
 
-	req, err := http.NewRequest("GET", upstreamURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", upstreamURL, nil)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -154,13 +168,19 @@ func ProxyGet(targetHost string, targetPort int, targetPath string, apiKey strin
 
 	resp, err := sharedClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, nil, fmt.Errorf("%w: %s: %v", ErrUpstreamTimeout, upstreamURL, err)
+		}
+		return 0, nil, fmt.Errorf("%w: %s: %v", ErrUpstreamUnreachable, upstreamURL, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, nil, err
+		return resp.StatusCode, nil, fmt.Errorf("read upstream body: %w", err)
+	}
+	if len(body) == 0 {
+		return resp.StatusCode, nil, ErrEmptyResponse
 	}
 
 	return resp.StatusCode, body, nil

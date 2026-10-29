@@ -102,16 +102,22 @@ func (s *Server) cleanupLoop() {
 	}
 }
 
-// gracefulShutdown handles SIGINT/SIGTERM
+// gracefulShutdown handles SIGINT/SIGTERM with a 30s budget for in-flight requests to drain.
+// Reference: Go patterns — "Make the zero value useful" + graceful shutdown budget 30s.
 func (s *Server) gracefulShutdown() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
 	log.Println("[substore-ui-go] 正在关闭...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_ = s.httpServer.Shutdown(ctx)
+
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		log.Printf("[substore-ui-go] 强制关闭: %v", err)
+		_ = s.httpServer.Close()
+	}
+	log.Println("[substore-ui-go] 服务已退出")
 }
 
 // extractIP gets the client IP from the request, handling IPv6 addresses

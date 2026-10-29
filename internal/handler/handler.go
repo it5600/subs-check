@@ -2,8 +2,10 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -269,10 +271,17 @@ func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 	// Try cache first
 	nodes := service.GetCachedNodes()
 	if nodes == nil {
-		// Fetch from subs-check
-		statusCode, body, err := service.ProxyGet(a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/sub/all.yaml", a.Config.APIKey)
+		// Fetch from subs-check (propagate request context for cancellation)
+		statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/sub/all.yaml", a.Config.APIKey)
 		if err != nil {
-			WriteJSON(w, http.StatusBadGateway, service.FormatError(502002, "拉取节点失败"))
+			switch {
+			case errors.Is(err, service.ErrUpstreamTimeout):
+				WriteJSON(w, http.StatusGatewayTimeout, service.FormatError(504001, "上游服务响应超时"))
+			case errors.Is(err, service.ErrUpstreamUnreachable):
+				WriteJSON(w, http.StatusBadGateway, service.FormatError(502001, "上游服务不可达"))
+			default:
+				WriteJSON(w, http.StatusBadGateway, service.FormatError(502002, "拉取节点失败"))
+			}
 			return
 		}
 		if statusCode != http.StatusOK {
@@ -706,7 +715,11 @@ func ServeStatic(w http.ResponseWriter, r *http.Request, pathname string, public
 		WriteJSON(w, http.StatusInternalServerError, service.FormatError(500006, "读取文件失败"))
 		return
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("[handler] 关闭文件 %s 失败: %v", cleanPath, cerr)
+		}
+	}()
 
 	info, err := f.Stat()
 	if err != nil || info.IsDir() {
