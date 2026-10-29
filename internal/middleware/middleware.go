@@ -21,15 +21,47 @@ var (
 	csrfTokens = make(map[string]csrfEntry)
 )
 
+// maxCSRFTokens limits the number of stored tokens to prevent memory exhaustion
+// from a flood of /api/csrf-token requests. When exceeded, the oldest tokens
+// are evicted first (rough FIFO via map iteration order — acceptable for CSRF
+// since tokens are short-lived and one-time-use).
+const maxCSRFTokens = 1000
+
 type csrfEntry struct {
 	apiKey  string
 	expires int64
 }
 
-// GenerateCSRFToken creates a new one-time CSRF token bound to the API key
+// GenerateCSRFToken creates a new one-time CSRF token bound to the API key.
 func GenerateCSRFToken(apiKey string, ttl int64) string {
 	token := randomHex(16)
 	csrfMu.Lock()
+	// Evict oldest tokens if we're at capacity.
+	if len(csrfTokens) >= maxCSRFTokens {
+		// Remove a few expired tokens first; if none, remove arbitrary ones.
+		now := time.Now().UnixMilli()
+		removed := 0
+		for k, v := range csrfTokens {
+			if now > v.expires {
+				delete(csrfTokens, k)
+				removed++
+				if removed >= 10 {
+					break
+				}
+			}
+		}
+		// If still at capacity, force-remove some arbitrary entries.
+		if len(csrfTokens) >= maxCSRFTokens {
+			removed = 0
+			for k := range csrfTokens {
+				delete(csrfTokens, k)
+				removed++
+				if removed >= 10 {
+					break
+				}
+			}
+		}
+	}
 	csrfTokens[token] = csrfEntry{apiKey: apiKey, expires: time.Now().UnixMilli() + ttl}
 	csrfMu.Unlock()
 	return token

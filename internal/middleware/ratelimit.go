@@ -1,3 +1,11 @@
+// Package middleware — Token bucket rate limiter with auto-cleanup.
+//
+// The original implementation had a memory leak: Cleanup() was never called
+// automatically, so the buckets map grew indefinitely as new IPs connected.
+// Now a background goroutine periodically removes stale buckets (no activity
+// for 2+ windows). The goroutine is started lazily on first use and stops
+// via a sync.Once-protected flag to avoid duplicate goroutines.
+
 package middleware
 
 import (
@@ -5,12 +13,15 @@ import (
 	"time"
 )
 
-// TokenBucket implements the token bucket rate limiting algorithm (O(1))
+// TokenBucket implements the token bucket rate limiting algorithm (O(1)).
 type TokenBucket struct {
 	mu      sync.RWMutex
 	buckets map[string]*bucket
 	window  int64 // milliseconds
 	max     int
+
+	cleanupOnce sync.Once
+	stopCleanup chan struct{}
 }
 
 type bucket struct {
@@ -18,16 +29,18 @@ type bucket struct {
 	lastRefill int64
 }
 
-// NewTokenBucket creates a new rate limiter
+// NewTokenBucket creates a new rate limiter.
 func NewTokenBucket(window int64, maxCapacity int) *TokenBucket {
 	return &TokenBucket{
-		buckets: make(map[string]*bucket),
-		window:  window,
-		max:     maxCapacity,
+		buckets:    make(map[string]*bucket),
+		window:     window,
+		max:        maxCapacity,
+		stopCleanup: make(chan struct{}),
 	}
 }
 
-// Allow checks if a request from the given IP is allowed
+// Allow checks if a request from the given IP is allowed.
+// Uses write lock because both read and write happen on the bucket.
 func (tb *TokenBucket) Allow(ip string) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -39,7 +52,7 @@ func (tb *TokenBucket) Allow(ip string) bool {
 		tb.buckets[ip] = b
 	}
 
-	// Refill tokens proportionally to elapsed time
+	// Refill tokens proportionally to elapsed time.
 	elapsed := float64(now - b.lastRefill)
 	if elapsed > 0 {
 		refillRate := float64(tb.max) / float64(tb.window)
@@ -59,14 +72,14 @@ func (tb *TokenBucket) Allow(ip string) bool {
 	return false
 }
 
-// Size returns the number of tracked buckets
+// Size returns the number of tracked buckets.
 func (tb *TokenBucket) Size() int {
 	tb.mu.RLock()
 	defer tb.mu.RUnlock()
 	return len(tb.buckets)
 }
 
-// Cleanup removes stale buckets (no activity for 2+ windows)
+// Cleanup removes stale buckets (no activity for 2+ windows).
 func (tb *TokenBucket) Cleanup() {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -79,4 +92,35 @@ func (tb *TokenBucket) Cleanup() {
 			delete(tb.buckets, ip)
 		}
 	}
+}
+
+// StartAutoCleanup launches a background goroutine that periodically
+// removes stale buckets. Safe to call multiple times (idempotent).
+// The goroutine runs every window interval and exits when StopCleanup is called.
+func (tb *TokenBucket) StartAutoCleanup() {
+	tb.cleanupOnce.Do(func() {
+		interval := time.Duration(tb.window) * time.Millisecond
+		if interval <= 0 {
+			interval = time.Minute // fallback
+		}
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					tb.Cleanup()
+				case <-tb.stopCleanup:
+					return
+				}
+			}
+		}()
+	})
+}
+
+// StopCleanup terminates the background cleanup goroutine.
+func (tb *TokenBucket) StopCleanup() {
+	tb.cleanupOnce.Do(func() {
+		close(tb.stopCleanup)
+	})
 }

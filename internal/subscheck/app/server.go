@@ -62,6 +62,11 @@ func (a *SubStoreApp) Run() {
 	a.scApp.Run()
 }
 
+// HandlerApp returns the handler app for accessing shared components like rate limiter.
+func (a *SubStoreApp) HandlerApp() *handler.App {
+	return a.handlerApp
+}
+
 // SetupRoutes registers all routes on the Gin engine
 func (a *SubStoreApp) SetupRoutes(router *gin.Engine) error {
 	gin.SetMode(gin.ReleaseMode)

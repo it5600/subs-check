@@ -8,13 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
-
-	"substore-ui-go/internal/model"
 )
 
 // Sentinel errors for the service package.
@@ -38,68 +36,31 @@ var hopByHopHeaders = map[string]bool{
 	"upgrade":             true,
 }
 
-// sharedAgent reuses TCP connections (keep-alive)
+// sharedAgent reuses TCP connections (keep-alive).
+// Tuned for a management panel serving multiple concurrent users:
+// MaxIdleConnsPerHost raised from 10 to 32 to handle burst traffic
+// without connection churn.
 var sharedAgent = &http.Transport{
-	MaxIdleConns:        50,
-	MaxIdleConnsPerHost: 10,
-	IdleConnTimeout:     90 * time.Second,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   32,
+	IdleConnTimeout:       90 * time.Second,
+	// Reduce connection establishment latency for the first request.
+	DialContext: (&net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	// Enable HTTP/2 for lower latency on repeat requests.
+	ForceAttemptHTTP2:     true,
+	TLSHandshakeTimeout:   5 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
 }
 
-// sharedClient uses the keep-alive agent for all proxy requests
+// sharedClient uses the keep-alive agent for all proxy requests.
+// Timeout reduced from 30s to 15s — the upstream is a local service
+// and should respond well within that window.
 var sharedClient = &http.Client{
 	Transport: sharedAgent,
-	Timeout:   30 * time.Second,
-}
-
-// ===== Node Cache (TTL-based, avoids repeated YAML fetch+parse) =====
-//
-// Reference: ristretto/cache design — TTL cache with singleflight to avoid
-// thundering herd. Every request to /api/nodes re-fetches /sub/all.yaml and
-// re-parses it; caching for 30s eliminates that cost entirely.
-//
-// The cache is safe for concurrent access via sync.RWMutex.
-
-type nodeCacheEntry struct {
-	nodes     []model.Node
-	fetchedAt time.Time
-}
-
-var (
-	nodeCacheMu   sync.RWMutex
-	nodeCacheData *nodeCacheEntry
-)
-
-const nodeCacheTTL = 30 * time.Second
-
-// GetCachedNodes returns a copy of cached nodes if not expired, nil otherwise.
-// Returns a copy to prevent external mutation of the cached slice.
-func GetCachedNodes() []model.Node {
-	nodeCacheMu.RLock()
-	defer nodeCacheMu.RUnlock()
-	if nodeCacheData == nil || time.Since(nodeCacheData.fetchedAt) > nodeCacheTTL {
-		return nil
-	}
-	// Return a copy to prevent callers from mutating the cached slice.
-	nodes := make([]model.Node, len(nodeCacheData.nodes))
-	copy(nodes, nodeCacheData.nodes)
-	return nodes
-}
-
-// SetCachedNodes stores nodes in the cache with current timestamp.
-func SetCachedNodes(nodes []model.Node) {
-	nodeCacheMu.Lock()
-	defer nodeCacheMu.Unlock()
-	nodeCacheData = &nodeCacheEntry{
-		nodes:     nodes,
-		fetchedAt: time.Now(),
-	}
-}
-
-// InvalidateNodeCache clears the cache (call after config changes).
-func InvalidateNodeCache() {
-	nodeCacheMu.Lock()
-	defer nodeCacheMu.Unlock()
-	nodeCacheData = nil
+	Timeout:   15 * time.Second,
 }
 
 // ProxyRequest forwards an HTTP request to the upstream service.

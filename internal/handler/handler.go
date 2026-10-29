@@ -196,10 +196,12 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 // handleDashboard aggregates health + status + nodes + sources into a single response.
 // Reduces frontend from 3 round-trips to 1, improving load speed.
+// Node fetch uses singleflight to avoid duplicate upstream calls; status fetch
+// runs concurrently with node/source reads for lower latency.
 func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	stats := a.Stats.Snapshot()
 
-	// 1. Health data
+	// 1. Health data (local, no I/O)
 	healthData := map[string]interface{}{
 		"service": "substore-ui-go",
 		"uptime":  int64(time.Since(startTime).Seconds()),
@@ -215,56 +217,77 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// 2. Fetch node data (cached)
-	nodes := service.GetCachedNodes()
-	if nodes == nil {
-		statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/sub/all.yaml", a.Config.APIKey)
-		if err == nil && statusCode == http.StatusOK {
-			nodes = service.ParseNodesFromYaml(string(body))
-			service.SetCachedNodes(nodes)
+	// 2. Fetch node data (cached + singleflight)
+	nodeCh := make(chan []model.Node, 1)
+	go func() {
+		nodes, _ := service.FetchNodesWithSingleflight(func() ([]model.Node, error) {
+			statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/sub/all.yaml", a.Config.APIKey)
+			if err != nil || statusCode != http.StatusOK {
+				return nil, err
+			}
+			return service.ParseNodesFromYaml(string(body)), nil
+		})
+		nodeCh <- nodes
+	}()
+
+	// 3. Fetch subscription sources (local file read)
+	sourceCh := make(chan []model.Source, 1)
+	go func() {
+		if cfg, err := service.ReadConfigFile(a.Config.ConfigPath); err == nil {
+			sourceCh <- service.ParseSubUrls(cfg)
+		} else {
+			sourceCh <- nil
 		}
-	}
+	}()
+
+	// 4. Fetch upstream status (best effort, non-blocking)
+	statusCh := make(chan model.PipelineStatus, 1)
+	go func() {
+		var pipeline model.PipelineStatus
+		if statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/api/status", a.Config.APIKey); err == nil && statusCode == http.StatusOK {
+			var statusJSON struct {
+				Checking   bool `json:"checking"`
+				Available  int  `json:"available"`
+				ProxyCount int  `json:"proxyCount"`
+				Pipeline   struct {
+					SpeedPass int `json:"speedPass"`
+				} `json:"pipeline"`
+			}
+			if json.Unmarshal(body, &statusJSON) == nil {
+				pipeline = model.PipelineStatus{
+					Checking:   statusJSON.Checking,
+					Available:  statusJSON.Available,
+					ProxyCount: statusJSON.ProxyCount,
+					SpeedPass:  statusJSON.Pipeline.SpeedPass,
+				}
+			}
+		}
+		statusCh <- pipeline
+	}()
+
+	// Collect all results (all three run concurrently above)
+	nodes := <-nodeCh
+	sources := <-sourceCh
+	pipeline := <-statusCh
+
 	var nodeSummary model.NodeSummary
 	if nodes != nil {
 		nodeSummary = model.NodeSummary{
 			Total:     len(nodes),
 			ByType:    map[string]int{},
-			Available: len(nodes), // all parsed nodes are available
+			Available: len(nodes),
 		}
 		for _, n := range nodes {
 			nodeSummary.ByType[n.Type]++
 		}
 	}
 
-	// 3. Fetch subscription sources
 	var sourceSummary model.SourceSummary
-	if cfg, err := service.ReadConfigFile(a.Config.ConfigPath); err == nil {
-		sources := service.ParseSubUrls(cfg)
+	if sources != nil {
 		sourceSummary = model.SourceSummary{
 			Total:   len(sources),
 			Enabled: len(sources),
 			List:    sources,
-		}
-	}
-
-	// 4. Try to fetch upstream status (non-blocking — best effort)
-	var pipeline model.PipelineStatus
-	if statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/api/status", a.Config.APIKey); err == nil && statusCode == http.StatusOK {
-		var statusJSON struct {
-			Checking   bool `json:"checking"`
-			Available  int  `json:"available"`
-			ProxyCount int  `json:"proxyCount"`
-			Pipeline   struct {
-				SpeedPass int `json:"speedPass"`
-			} `json:"pipeline"`
-		}
-		if json.Unmarshal(body, &statusJSON) == nil {
-			pipeline = model.PipelineStatus{
-				Checking:   statusJSON.Checking,
-				Available:  statusJSON.Available,
-				ProxyCount: statusJSON.ProxyCount,
-				SpeedPass:  statusJSON.Pipeline.SpeedPass,
-			}
 		}
 	}
 
@@ -354,30 +377,33 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleNodes fetches and returns the node list with filtering and pagination.
-// Uses a 30s TTL cache to avoid re-fetching and re-parsing YAML on every request.
+// Uses a 30s TTL cache + singleflight to avoid re-fetching and re-parsing YAML
+// on every request, and to collapse concurrent cache-miss requests into one.
 func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
-	// Try cache first
-	nodes := service.GetCachedNodes()
-	if nodes == nil {
-		// Fetch from subs-check (propagate request context for cancellation)
+	nodes, err := service.FetchNodesWithSingleflight(func() ([]model.Node, error) {
 		statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/sub/all.yaml", a.Config.APIKey)
 		if err != nil {
-			switch {
-			case errors.Is(err, service.ErrUpstreamTimeout):
-				WriteJSON(w, http.StatusGatewayTimeout, service.FormatError(504001, "上游服务响应超时"))
-			case errors.Is(err, service.ErrUpstreamUnreachable):
-				WriteJSON(w, http.StatusBadGateway, service.FormatError(502001, "上游服务不可达"))
-			default:
-				WriteJSON(w, http.StatusBadGateway, service.FormatError(502002, "拉取节点失败"))
-			}
-			return
+			return nil, err
 		}
 		if statusCode != http.StatusOK {
-			WriteJSON(w, http.StatusBadGateway, service.FormatError(502002, fmt.Sprintf("拉取节点失败: HTTP %d", statusCode)))
-			return
+			return nil, fmt.Errorf("upstream returned HTTP %d", statusCode)
 		}
-		nodes = service.ParseNodesFromYaml(string(body))
-		service.SetCachedNodes(nodes)
+		return service.ParseNodesFromYaml(string(body)), nil
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrUpstreamTimeout):
+			WriteJSON(w, http.StatusGatewayTimeout, service.FormatError(504001, "上游服务响应超时"))
+		case errors.Is(err, service.ErrUpstreamUnreachable):
+			WriteJSON(w, http.StatusBadGateway, service.FormatError(502001, "上游服务不可达"))
+		default:
+			WriteJSON(w, http.StatusBadGateway, service.FormatError(502002, "拉取节点失败"))
+		}
+		return
+	}
+	if nodes == nil {
+		WriteJSON(w, http.StatusBadGateway, service.FormatError(502002, "拉取节点失败"))
+		return
 	}
 
 	// Parse query parameters
