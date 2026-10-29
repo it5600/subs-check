@@ -1,0 +1,24 @@
+# Binaries
+substore-ui-go
+substore-ui-go.exe
+substore-ui-go-linux
+*.exe
+*.dll
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

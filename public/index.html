@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sub-Store 管理面板</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, 'Segoe UI', 'Noto Sans SC', sans-serif; background: #0f172a; color: #e2e8f0; }
+
+        /* ====== Tailwind 工具类替代（无需 CDN） ====== */
+        .hidden { display: none !important; }
+        .flex { display: flex; }
+        .items-center { align-items: center; }
+        .justify-between { justify-content: space-between; }
+        .gap-2 { gap: 0.5rem; }
+        .gap-4 { gap: 1rem; }
+        .flex-1 { flex: 1; }
+        .w-32 { width: 8rem; }
+        .w-full { width: 100%; }
+        .mb-2 { margin-bottom: 0.5rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .text-xl { font-size: 1.25rem; }
+        .text-sm { font-size: 0.875rem; }
+        .text-xs { font-size: 0.75rem; }
+        .font-bold { font-weight: 700; }
+        .font-medium { font-weight: 500; }
+        .text-slate-400 { color: #94a3b8; }
+        .text-slate-500 { color: #64748b; }
+        .text-red-400 { color: #f87171; }
+        .text-center { text-align: center; }
+        .grid { display: grid; }
+        .grid-cols-1 { grid-template-columns: 1fr; }
+        .md\:grid-cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+        .space-y-1 > * + * { margin-top: 0.25rem; }
+        .mt-2 { margin-top: 0.5rem; }
+        @media (max-width: 768px) {
+            .md\:grid-cols-3 { grid-template-columns: 1fr; }
+        }
+
+        /* Sidebar */
+        .sidebar { width: 240px; min-height: 100vh; background: #1e293b; position: fixed; left: 0; top: 0; padding: 1rem; z-index: 100; transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; }
+        .sidebar-header { padding: 0.5rem 0.8rem 1.5rem; border-bottom: 1px solid #334155; margin-bottom: 1rem; }
+        .sidebar-header .logo { font-size: 1.2rem; font-weight: 700; color: #f1f5f9; display: flex; align-items: center; gap: 0.4rem; }
+        .sidebar-header .logo span { color: #3b82f6; }
+        .sidebar-header .version { font-size: 0.65rem; color: #64748b; margin-top: 0.2rem; }
+        .sidebar-nav { flex: 1; overflow-y: auto; }
+        .sidebar-nav a { display: flex; align-items: center; gap: 0.6rem; padding: 0.65rem 0.8rem; border-radius: 8px; color: #94a3b8; text-decoration: none; margin-bottom: 0.15rem; transition: all 0.15s; font-size: 0.85rem; }
+        .sidebar-nav a:hover { background: #334155; color: #e2e8f0; }
+        .sidebar-nav a.active { background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3); }
+        .sidebar-nav .icon { width: 20px; text-align: center; font-size: 1rem; }
+        .sidebar-footer { padding-top: 1rem; border-top: 1px solid #334155; margin-top: auto; }
+        .sidebar-footer .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.4rem; }
+        .sidebar-footer .status-dot.online { background: #10b981; box-shadow: 0 0 6px #10b981; }
+        .sidebar-footer .status-dot.offline { background: #ef4444; }
+        .sidebar-footer .status-text { font-size: 0.7rem; color: #64748b; }
+        .main { margin-left: 240px; padding: 1.5rem 2rem; min-height: 100vh; max-width: 1400px; }
+        /* Cards */
+        .card { background: #1e293b; border-radius: 12px; padding: 1.2rem; margin-bottom: 1rem; border: 1px solid #334155; transition: border-color 0.2s; }
+        .card:hover { border-color: #475569; }
+        .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+        .card-header h3 { font-size: 0.85rem; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+        /* Stats */
+        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem; }
+        .stat-card { background: #1e293b; border-radius: 10px; padding: 1rem; border: 1px solid #334155; transition: all 0.2s; }
+        .stat-card:hover { border-color: #3b82f6; transform: translateY(-2px); }
+        .stat-card .num { font-size: 1.8rem; font-weight: 700; color: #3b82f6; line-height: 1.2; }
+        .stat-card .label { font-size: 0.75rem; color: #64748b; margin-top: 0.3rem; }
+        .stat-card .icon { font-size: 1.5rem; float: right; opacity: 0.3; }
+        /* Buttons */
+        .btn { padding: 0.5rem 1rem; border-radius: 8px; border: none; cursor: pointer; font-size: 0.85rem; transition: all 0.15s; display: inline-flex; align-items: center; gap: 0.4rem; }
+        .btn-primary { background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; }
+        .btn-primary:hover { box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4); transform: translateY(-1px); }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+        .btn-danger { background: linear-gradient(135deg, #ef4444, #dc2626); color: #fff; }
+        .btn-danger:hover { box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4); }
+        .btn-success { background: linear-gradient(135deg, #10b981, #059669); color: #fff; }
+        .btn-success:hover { box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4); }
+        .btn-sm { padding: 0.3rem 0.7rem; font-size: 0.75rem; border-radius: 6px; }
+        .btn-ghost { background: transparent; color: #94a3b8; border: 1px solid #475569; }
+        .btn-ghost:hover { background: #334155; color: #e2e8f0; border-color: #64748b; }
+        /* Inputs */
+        input, select, textarea { background: #0f172a; border: 1px solid #475569; color: #e2e8f0; padding: 0.5rem 0.7rem; border-radius: 8px; font-size: 0.85rem; width: 100%; transition: border-color 0.2s; }
+        input:focus, select:focus, textarea:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+        input[type="checkbox"] { width: auto; }
+        /* Table */
+        .table-wrap { overflow-x: auto; border-radius: 8px; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+        th { text-align: left; padding: 0.6rem 0.8rem; color: #64748b; border-bottom: 1px solid #334155; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+        td { padding: 0.6rem 0.8rem; border-bottom: 1px solid #1e293b; }
+        tbody tr { transition: background 0.1s; }
+        tbody tr:hover { background: #1a2535; }
+        /* Badges */
+        .badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 6px; font-size: 0.7rem; font-weight: 600; }
+        .badge-green { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }
+        .badge-red { background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }
+        .badge-blue { background: rgba(59, 130, 246, 0.15); color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.3); }
+        .badge-gray { background: rgba(100, 116, 139, 0.15); color: #94a3b8; border: 1px solid rgba(100, 116, 139, 0.3); }
+        .badge-orange { background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }
+        /* Toast */
+        .toast { position: fixed; top: 1rem; right: 1rem; padding: 0.75rem 1.2rem; border-radius: 10px; font-size: 0.85rem; z-index: 9999; opacity: 0; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); transform: translateX(120%); box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3); }
+        .toast.show { opacity: 1; transform: translateX(0); }
+        .toast-success { background: linear-gradient(135deg, #10b981, #059669); color: #fff; }
+        .toast-error { background: linear-gradient(135deg, #ef4444, #dc2626); color: #fff; }
+        .toast-info { background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; }
+        /* Loading */
+        .loading { display: inline-block; width: 18px; height: 18px; border: 2px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .skeleton { background: linear-gradient(90deg, #1e293b 25%, #334155 50%, #1e293b 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 6px; }
+        @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+        /* Logs */
+        .log-line { font-size: 0.75rem; font-family: 'Courier New', monospace; padding: 0.15rem 0; color: #94a3b8; line-height: 1.6; }
+        .log-line .ts { color: #64748b; }
+        .log-line .lvl { font-weight: 700; margin: 0 0.3rem; display: inline-block; min-width: 30px; }
+        .lvl-INF { color: #3b82f6; }
+        .lvl-ERR { color: #ef4444; }
+        .lvl-WRN { color: #f59e0b; }
+        .lvl-DBG { color: #64748b; }
+        /* Pagination */
+        .pagination { display: flex; gap: 0.4rem; align-items: center; justify-content: center; margin-top: 1rem; flex-wrap: wrap; }
+        .pagination button { padding: 0.35rem 0.8rem; border-radius: 6px; background: #334155; color: #e2e8f0; border: none; cursor: pointer; font-size: 0.75rem; transition: all 0.15s; }
+        .pagination button:hover:not(:disabled) { background: #475569; }
+        .pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
+        .pagination button.active { background: #3b82f6; color: #fff; }
+        .pagination .page-info { font-size: 0.75rem; color: #94a3b8; margin: 0 0.5rem; }
+        /* Empty state */
+        .empty-state { text-align: center; padding: 3rem; color: #64748b; }
+        .empty-state .icon { font-size: 2.5rem; margin-bottom: 0.8rem; opacity: 0.5; }
+        /* Login */
+        .login-overlay { display: flex; align-items: center; justify-content: center; min-height: 100vh; background: radial-gradient(circle at center, #1e293b, #0f172a); }
+        .login-card { background: #1e293b; border-radius: 16px; padding: 2.5rem; width: 420px; max-width: 90vw; border: 1px solid #334155; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4); }
+        .login-card .logo { text-align: center; font-size: 2rem; font-weight: 800; margin-bottom: 0.5rem; }
+        .login-card .logo span { color: #3b82f6; }
+        .login-card .subtitle { text-align: center; color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; }
+        /* Mobile */
+        .mobile-toggle { display: none; position: fixed; top: 0.8rem; left: 0.8rem; z-index: 200; background: #1e293b; border: 1px solid #475569; color: #e2e8f0; padding: 0.5rem 0.8rem; border-radius: 8px; cursor: pointer; font-size: 1.2rem; }
+        @media (max-width: 768px) {
+            .sidebar { transform: translateX(-100%); width: 260px; }
+            .sidebar.open { transform: translateX(0); box-shadow: 4px 0 20px rgba(0, 0, 0, 0.5); }
+            .main { margin-left: 0; padding: 1rem; }
+            .mobile-toggle { display: block; }
+            .stat-grid { grid-template-columns: 1fr; }
+        }
+        /* Scrollbar */
+        .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+        .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+        /* Animations */
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        /* Progress bar */
+        .progress-bar { height: 4px; background: #334155; border-radius: 2px; overflow: hidden; }
+        .progress-bar .fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #10b981); transition: width 0.3s; }
+        /* Nav link (sidebar) */
+        .nav-link { display: flex; align-items: center; gap: 0.6rem; padding: 0.65rem 0.8rem; border-radius: 8px; color: #94a3b8; text-decoration: none; margin-bottom: 0.15rem; transition: all 0.15s; font-size: 0.85rem; }
+        .nav-link:hover { background: #334155; color: #e2e8f0; }
+        .nav-link.active { background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3); }
+        /* Page section */
+        .page { display: none; }
+        .page.active { display: block; }
+        /* Block display */
+        .block { display: block; }
+        /* Space-y-1 (vertical stacking with small gap) */
+        .space-y-1 > * + * { margin-top: 0.25rem; }
+        /* Responsive grid */
+        .grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+        @media (min-width: 768px) {
+            .grid-cols-3 { grid-template-columns: repeat(3, 1fr); }
+        }
+        .grid-cols-3 { grid-template-columns: 1fr; }
+    </style>
+</head>
+<body>
+    <button class="mobile-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+
+    <!-- Sidebar -->
+    <nav class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">⚡ Sub<span>Store</span></div>
+            <div class="version">Go Edition v2.0</div>
+        </div>
+        <div class="sidebar-nav">
+            <a href="#dashboard" class="nav-link active" data-page="dashboard"><span class="icon">📊</span>仪表盘</a>
+            <a href="#nodes" class="nav-link" data-page="nodes"><span class="icon">🌐</span>节点管理</a>
+            <a href="#sources" class="nav-link" data-page="sources"><span class="icon">🔗</span>订阅源</a>
+            <a href="#substore" class="nav-link" data-page="substore"><span class="icon">📦</span>Sub-Store</a>
+            <a href="#logs" class="nav-link" data-page="logs"><span class="icon">📋</span>日志</a>
+            <a href="#settings" class="nav-link" data-page="settings"><span class="icon">⚙️</span>设置</a>
+        </div>
+        <div class="sidebar-footer">
+            <div class="status-text"><span class="status-dot online"></span>服务在线</div>
+        </div>
+    </nav>
+
+    <!-- Main -->
+    <div class="main">
+        <!-- Dashboard -->
+        <section id="page-dashboard" class="page active fade-in">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-xl font-bold">仪表盘</h1>
+                <button class="btn btn-ghost btn-sm" onclick="App.loadDashboard()">🔄 刷新</button>
+            </div>
+            <div class="stat-grid" id="dashboard-stats"><div class="loading"></div></div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="card">
+                    <div class="card-header"><h3>节点概览</h3></div>
+                    <div id="node-overview"></div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><h3>Sub-Store</h3></div>
+                    <div id="substore-info"></div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><h3>系统信息</h3></div>
+                    <div id="sys-info"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Nodes -->
+        <section id="page-nodes" class="page hidden">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-xl font-bold">节点管理</h1>
+                <button class="btn btn-ghost btn-sm" onclick="App.loadNodes()">🔄 刷新</button>
+            </div>
+            <div class="card">
+                <div class="flex gap-2 mb-4">
+                    <input type="text" id="node-search" placeholder="🔍 搜索节点名称..." class="flex-1" oninput="App.debouncedRenderNodes()">
+                    <select id="node-filter-type" class="w-32" onchange="App.loadNodes()">
+                        <option value="">全部类型</option>
+                    </select>
+                </div>
+                <div id="nodes-table"><div class="loading"></div></div>
+                <div id="nodes-pagination"></div>
+            </div>
+        </section>
+
+        <!-- Sources -->
+        <section id="page-sources" class="page hidden">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-xl font-bold">订阅源管理</h1>
+                <button class="btn btn-ghost btn-sm" onclick="App.loadSources()">🔄 刷新</button>
+            </div>
+            <div class="card">
+                <div class="card-header"><h3>添加订阅源</h3></div>
+                <div class="flex gap-2 mb-4">
+                    <input type="text" id="source-url" placeholder="https://example.com/sub.yaml" onkeydown="if(event.key==='Enter')App.addSource()">
+                    <button class="btn btn-primary" onclick="App.addSource()">➕ 添加</button>
+                </div>
+                <div id="sources-list"></div>
+            </div>
+        </section>
+
+        <!-- Sub-Store -->
+        <section id="page-substore" class="page hidden">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-xl font-bold">Sub-Store</h1>
+                <button class="btn btn-ghost btn-sm" onclick="App.loadSubstore()">🔄 刷新</button>
+            </div>
+            <div class="card">
+                <div class="card-header"><h3>集合（Collections）</h3></div>
+                <div id="substore-collections"><div class="loading"></div></div>
+            </div>
+            <div class="card">
+                <div class="card-header"><h3>订阅（Subscriptions）</h3></div>
+                <div id="substore-subs"><div class="loading"></div></div>
+            </div>
+        </section>
+
+        <!-- Logs -->
+        <section id="page-logs" class="page hidden">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-xl font-bold">运行日志</h1>
+                <div class="flex gap-2">
+                    <label class="flex items-center gap-2 text-sm text-slate-400">
+                        <input type="checkbox" id="auto-refresh-logs" onchange="App.toggleLogAutoRefresh()" style="width:auto">
+                        自动刷新
+                    </label>
+                    <button class="btn btn-ghost btn-sm" onclick="App.loadLogs()">🔄 刷新</button>
+                    <button class="btn btn-ghost btn-sm" onclick="App.clearLogs()">🗑️ 清屏</button>
+                </div>
+            </div>
+            <div class="card">
+                <div id="logs-container" class="scrollbar-thin" style="max-height: 600px; overflow-y: auto;"></div>
+            </div>
+        </section>
+
+        <!-- Settings -->
+        <section id="page-settings" class="page hidden">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-xl font-bold">设置</h1>
+                <button class="btn btn-ghost btn-sm" onclick="App.loadSettings()">🔄 刷新</button>
+            </div>
+            <div class="card">
+                <div class="card-header"><h3>API 访问</h3></div>
+                <div class="mb-2">鉴权方式: <span class="badge badge-green">Cookie Session</span></div>
+                <div class="text-xs text-slate-500 mb-2">所有 /api/* 请求通过 HttpOnly Cookie 自动鉴权</div>
+                <div class="text-xs text-slate-500 mb-2">写操作（POST/DELETE）需额外携带 CSRF Token</div>
+                <button class="btn btn-ghost btn-sm" onclick="App.refreshCsrfToken()">🔐 刷新 CSRF Token</button>
+            </div>
+            <div class="card">
+                <div class="card-header"><h3>配置文件（config.yaml）</h3></div>
+                <pre id="config-display" class="scrollbar-thin" style="max-height: 400px; overflow-y: auto; font-size: 0.75rem; background: #0f172a; padding: 1rem; border-radius: 8px;"></pre>
+            </div>
+        </section>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

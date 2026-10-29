@@ -1,0 +1,21 @@
+services:
+  substore-ui-go:
+    build: .
+    container_name: substore-ui-go
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - PORT=8300
+      - HOST=0.0.0.0
+      - API_KEY=hy584521
+      - SUBS_CHECK_HOST=127.0.0.1
+      - SUBS_CHECK_PORT=8199
+      - SUB_STORE_HOST=127.0.0.1
+      - SUB_STORE_PORT=8299
+      - SUB_STORE_PATH=/s-7f3K9mQx
+      - SUBS_CONFIG_PATH=/vol1/1000/Docker/subs-check/config/config.yaml
+      - PUBLIC_DIR=./public
+      - RATE_LIMIT_MAX=200
+    volumes:
+      - /vol1/1000/Docker/substore-ui/public:/app/public:ro
+      - /vol1/1000/Docker/subs-check/config/config.yaml:/vol1/1000/Docker/subs-check/config/config.yaml:rw
