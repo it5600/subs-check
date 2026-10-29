@@ -59,14 +59,10 @@ func Load() *Config {
 	// Default security headers
 	secHeaders := map[string]string{
 		"X-Content-Type-Options":    "nosniff",
-		"X-Frame-Options":           "DENY",
+		"X-Frame-Options":           "SAMEORIGIN",
 		"X-XSS-Protection":          "1; mode=block",
 		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 		"Referrer-Policy":           "strict-origin-when-cross-origin",
-	}
-	// In gateway/iframe mode, allow framing from fnOS desktop
-	if gatewayMode {
-		secHeaders["X-Frame-Options"] = "SAMEORIGIN"
 	}
 
 	return &Config{
