@@ -1,3 +1,4 @@
+// Package config provides runtime configuration management for substore-ui-go.
 package config
 
 import (

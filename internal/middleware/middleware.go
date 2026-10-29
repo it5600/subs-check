@@ -106,7 +106,7 @@ func CheckAuth(r *http.Request, apiKey string, sessions *SessionStore) (bool, st
 	// 1. Cookie Session
 	cookie, err := r.Cookie("substore_sid")
 	if err == nil && cookie.Value != "" {
-		if sessions.Get(cookie.Value) != nil {
+		if sessions.Get(cookie.Value) {
 			return true, "session"
 		}
 	}

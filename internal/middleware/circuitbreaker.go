@@ -1,3 +1,5 @@
+// Package middleware provides HTTP middleware components: CSRF, rate limiting,
+// circuit breaking, session management, CORS, and security headers.
 package middleware
 
 import (

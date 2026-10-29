@@ -1,3 +1,4 @@
+// Package handler provides HTTP request handlers for the substore-ui-go API.
 package handler
 
 import (
@@ -172,15 +173,15 @@ func (a *App) HandleAPI(w http.ResponseWriter, r *http.Request, pathname string)
 }
 
 // handleHealth returns service health status
-func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	stats := a.Stats.Snapshot()
 	data := map[string]interface{}{
 		"service": "substore-ui-go",
 		"uptime":  int64(time.Since(startTime).Seconds()),
 		"stats": map[string]interface{}{
-			"requests":    stats.Requests,
-			"errors":      stats.Errors,
-			"rateLimited": stats.RateLimited,
+			"requests":     stats.Requests,
+			"errors":       stats.Errors,
+			"rateLimited":  stats.RateLimited,
 			"rateLimitMap": a.RateLimiter.Size(),
 		},
 		"upstream": map[string]string{
@@ -192,7 +193,7 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCSRFToken generates a new CSRF token
-func (a *App) handleCSRFToken(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleCSRFToken(w http.ResponseWriter, _ *http.Request) {
 	token := middleware.GenerateCSRFToken(a.Config.APIKey, a.Config.CSRFTokenTTL)
 	WriteJSON(w, http.StatusOK, service.FormatOK(map[string]string{"csrfToken": token}))
 }
@@ -310,9 +311,7 @@ func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 	// Single-pass filter: combine search + type in one iteration
 	// (was two separate O(n) scans, now one O(n) scan).
 	// Skip allocation entirely when no filter is active.
-	if search == "" && typeFilter == "" {
-		// No filtering needed — use nodes directly
-	} else {
+	if search != "" || typeFilter != "" {
 		filtered := make([]model.Node, 0, len(nodes))
 		for _, n := range nodes {
 			if search != "" && !strings.Contains(strings.ToLower(n.Name), search) {
@@ -582,14 +581,12 @@ func modifySubUrls(lines []string, newURL string) []string {
 		}
 		if inSubUrls {
 			if reNonSpaceStart.MatchString(lines[i]) {
-				inSubUrls = false
-				continue
+				break
 			}
 			trimmed := strings.TrimSpace(lines[i])
 			if trimmed == "[]" {
 				lines[i] = `  - "` + newURL + `"`
 				foundEmptyArray = true
-				inSubUrls = false
 				break
 			}
 		}

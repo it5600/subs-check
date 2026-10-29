@@ -1,11 +1,10 @@
-# golangci-lint configuration
-# https://golangci-lint.run/usage/configuration/
+# golangci-lint configuration v2
+# https://golangci-lint.run/usage/configuration/config_file/
+
+version: "2"
 
 run:
   timeout: 5m
-  skip-dirs:
-    - vendor
-    - public
   tests: true
 
 linters-settings:
@@ -14,12 +13,8 @@ linters-settings:
     check-blank: false
   govet:
     check-shadowing: false
-  gosimple:
-    checks-all: false
   staticcheck:
     checks: ["all", "-ST1000", "-ST1003", "-ST1020", "-ST1021", "-ST1022"]
-  unused:
-    local-blocks: true
   gofmt:
     simplify: true
   revive:
@@ -38,12 +33,13 @@ linters:
     - govet
     - staticcheck
     - unused
-    - gosimple
     - ineffassign
-    - typecheck
-    - gofmt
     - revive
     - misspell
+
+formatters:
+  enable:
+    - gofmt
 
 issues:
   max-issues-per-linter: 0

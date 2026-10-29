@@ -1,3 +1,4 @@
+// Package server provides the HTTP server and request routing for substore-ui-go.
 package server
 
 import (
@@ -64,6 +65,8 @@ func (s *Server) Start() error {
 
 // handleRequest is the main request handler
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
+	s.app.Stats.IncRequests()
+
 	// 1. Security headers
 	middleware.ApplySecurityHeaders(w, s.config.SecurityHeaders)
 

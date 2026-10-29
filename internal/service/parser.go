@@ -1,3 +1,5 @@
+// Package service provides business logic: YAML parsing, HTTP proxying,
+// configuration management, and response formatting.
 package service
 
 import (
@@ -18,8 +20,8 @@ var (
 	reValidURL      = regexp.MustCompile(`^https?:\/\/[^\s\/].+`)
 )
 
-// parseNodesFromYaml parses proxy nodes from Clash/Mihomo YAML format
-// using gopkg.in/yaml.v3 for robust parsing (10-50x faster than regex)
+// ParseNodesFromYaml parses proxy nodes from Clash/Mihomo YAML format.
+// Uses gopkg.in/yaml.v3 for robust parsing (10-50x faster than regex).
 func ParseNodesFromYaml(yamlText string) []model.Node {
 	if yamlText == "" {
 		return nil
@@ -190,8 +192,8 @@ var htmlReplacer = strings.NewReplacer(
 	"'", "&#39;",
 )
 
-// EscapeHtml escapes HTML special characters to prevent XSS
-func EscapeHtml(s string) string {
+// EscapeHTML escapes HTML special characters to prevent XSS
+func EscapeHTML(s string) string {
 	if s == "" {
 		return ""
 	}

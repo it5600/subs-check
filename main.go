@@ -1,3 +1,4 @@
+// substore-ui-go is a lightweight Sub-Store management panel written in Go.
 package main
 
 import (

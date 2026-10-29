@@ -3,9 +3,9 @@ package service
 import (
 	"context"
 	"crypto/md5"
-	"errors"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,7 +60,7 @@ var sharedClient = &http.Client{
 // The cache is safe for concurrent access via sync.RWMutex.
 
 type nodeCacheEntry struct {
-	nodes    []model.Node
+	nodes     []model.Node
 	fetchedAt time.Time
 }
 
@@ -137,7 +137,12 @@ func ProxyRequest(w http.ResponseWriter, r *http.Request, targetHost string, tar
 		writeJSON(w, http.StatusBadGateway, FormatError(502001, "代理请求失败: "+err.Error()))
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			// Body close errors are non-fatal in streaming contexts
+			_ = cerr
+		}
+	}()
 
 	// Forward response headers (excluding hop-by-hop)
 	for k, v := range resp.Header {
@@ -173,7 +178,7 @@ func ProxyGet(ctx context.Context, targetHost string, targetPort int, targetPath
 		}
 		return 0, nil, fmt.Errorf("%w: %s: %v", ErrUpstreamUnreachable, upstreamURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -204,16 +209,18 @@ func WriteConfigFile(path string, content string) error {
 		return err
 	}
 	if _, err := f.WriteString(content); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
 	if err := f.Sync(); err != nil { // fsync to ensure durability
-		f.Close()
-		os.Remove(tmpPath)
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
 
 	// Atomic rename
 	return os.Rename(tmpPath, path)

@@ -126,7 +126,7 @@ func TestValidateURL(t *testing.T) {
 	}
 }
 
-func TestEscapeHtml(t *testing.T) {
+func TestEscapeHTML(t *testing.T) {
 	tests := []struct {
 		input    string
 		expected string
@@ -139,9 +139,9 @@ func TestEscapeHtml(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		result := EscapeHtml(tt.input)
+		result := EscapeHTML(tt.input)
 		if result != tt.expected {
-			t.Errorf("EscapeHtml(%q) = %q, expected %q", tt.input, result, tt.expected)
+			t.Errorf("EscapeHTML(%q) = %q, expected %q", tt.input, result, tt.expected)
 		}
 	}
 }

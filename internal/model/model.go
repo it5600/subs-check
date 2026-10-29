@@ -1,3 +1,4 @@
+// Package model defines data structures for the substore-ui-go API.
 package model
 
 // Node represents a proxy node parsed from all.yaml

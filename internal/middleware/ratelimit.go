@@ -19,11 +19,11 @@ type bucket struct {
 }
 
 // NewTokenBucket creates a new rate limiter
-func NewTokenBucket(window int64, max int) *TokenBucket {
+func NewTokenBucket(window int64, maxCapacity int) *TokenBucket {
 	return &TokenBucket{
 		buckets: make(map[string]*bucket),
 		window:  window,
-		max:     max,
+		max:     maxCapacity,
 	}
 }
 

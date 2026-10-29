@@ -13,20 +13,15 @@ func TestSessionStore_CreateAndGet(t *testing.T) {
 	ss := NewSessionStore(60000)
 	sid := ss.Create("test-key")
 
-	entry := ss.Get(sid)
-	if entry == nil {
-		t.Fatal("Expected valid session, got nil")
-	}
-	if entry.apiKey != "test-key" {
-		t.Errorf("Expected apiKey 'test-key', got %s", entry.apiKey)
+	if !ss.Get(sid) {
+		t.Fatal("Expected valid session, got false")
 	}
 }
 
 func TestSessionStore_GetNonexistent(t *testing.T) {
 	ss := NewSessionStore(60000)
-	entry := ss.Get("nonexistent")
-	if entry != nil {
-		t.Error("Expected nil for nonexistent session")
+	if ss.Get("nonexistent") {
+		t.Error("Expected false for nonexistent session")
 	}
 }
 
@@ -35,9 +30,8 @@ func TestSessionStore_Destroy(t *testing.T) {
 	sid := ss.Create("test-key")
 	ss.Destroy(sid)
 
-	entry := ss.Get(sid)
-	if entry != nil {
-		t.Error("Expected nil after destroy")
+	if ss.Get(sid) {
+		t.Error("Expected false after destroy")
 	}
 }
 
@@ -48,7 +42,7 @@ func TestSessionStore_DestroyAll(t *testing.T) {
 
 	ss.DestroyAll()
 
-	if ss.Get(sid1) != nil || ss.Get(sid2) != nil {
+	if ss.Get(sid1) || ss.Get(sid2) {
 		t.Error("Expected all sessions destroyed")
 	}
 	if ss.Count() != 0 {
@@ -63,8 +57,8 @@ func TestSessionStore_Expired(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	entry := ss.Get(sid)
-	if entry != nil {
-		t.Error("Expected nil for expired session")
+	if entry {
+		t.Error("Expected false for expired session")
 	}
 }
 

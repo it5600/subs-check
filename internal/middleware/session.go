@@ -18,8 +18,6 @@ type sessionEntry struct {
 	createdAt int64
 }
 
-const sessionCookieName = "substore_sid"
-
 // NewSessionStore creates a new session store
 func NewSessionStore(ttl int64) *SessionStore {
 	return &SessionStore{
@@ -28,7 +26,7 @@ func NewSessionStore(ttl int64) *SessionStore {
 	}
 }
 
-// CreateSession creates a new session and returns the session ID
+// Create creates a new session and returns the session ID.
 func (ss *SessionStore) Create(apiKey string) string {
 	sid := randomHex(32)
 	ss.mu.Lock()
@@ -41,21 +39,21 @@ func (ss *SessionStore) Create(apiKey string) string {
 	return sid
 }
 
-// Get retrieves a session by ID, returning nil if expired or not found
-func (ss *SessionStore) Get(sid string) *sessionEntry {
+// Get checks if a session exists and is valid, returning true if so.
+func (ss *SessionStore) Get(sid string) bool {
 	ss.mu.RLock()
 	entry, ok := ss.sessions[sid]
 	ss.mu.RUnlock()
 	if !ok {
-		return nil
+		return false
 	}
 	if time.Now().UnixMilli() > entry.expires {
 		ss.mu.Lock()
 		delete(ss.sessions, sid)
 		ss.mu.Unlock()
-		return nil
+		return false
 	}
-	return entry
+	return true
 }
 
 // Destroy removes a session

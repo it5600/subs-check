@@ -366,6 +366,10 @@
         </div>
       `;
     } catch (e) {
+      // 401 未授权：不显示错误状态，让 init() 显示登录页
+      if (e.message && e.message.includes('未授权')) {
+        throw e;
+      }
       statsEl.innerHTML = utils.errorState('加载失败: ' + e.message, 'loadDashboard');
       // 更新状态指示器
       const statusDot = document.getElementById('service-status-dot');
@@ -692,8 +696,17 @@
   async function init() {
     setupNav();
     try {
+      // 先检测是否已登录：调用 /api/health（无需认证）验证服务可达
+      await api.get('/api/health');
+      // 再尝试加载仪表盘数据（需要认证）
       await loadDashboard();
-    } catch {
+    } catch (e) {
+      // 401 → 未登录，显示登录页
+      if (e.message && e.message.includes('未授权')) {
+        showLoginScreen();
+        return;
+      }
+      // 其他错误 → 也显示登录页（服务可能未启动或网络不通）
       showLoginScreen();
     }
   }
