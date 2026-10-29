@@ -5,6 +5,11 @@ substore-ui-go-linux
 *.exe
 *.dll
 
+# Build artifacts
+dist/
+*.tar.gz
+*.zip
+
 # Test artifacts
 *.test
 *.out

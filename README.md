@@ -7,7 +7,11 @@
 ```
 substore-ui-go/
 ├── main.go                    # 入口
-├── go.mod / go.sum
+├── go.mod / go.sum            # 依赖锁定
+├── Makefile                   # 构建入口（make 兼容）
+├── scripts/
+│   ├── build.sh               # 统一构建脚本（bash）
+│   └── build.bat              # Windows 构建脚本
 ├── internal/
 │   ├── config/config.go       # 环境变量配置
 │   ├── model/model.go         # 数据结构
@@ -21,9 +25,14 @@ substore-ui-go/
 │   │   └── proxy.go           # HTTP 代理、节点缓存、ETag
 │   ├── handler/handler.go     # API 端点、静态文件服务
 │   └── server/server.go       # HTTP 服务器、中间件链
-└── public/
-    ├── index.html             # SPA 暗色主题（内联 CSS，无 CDN 依赖）
-    └── app.js                 # 前端逻辑（6 页面：仪表盘/节点/订阅源/SubStore/日志/设置）
+├── public/
+│   ├── index.html             # SPA 暗色主题（内联 CSS，无 CDN 依赖）
+│   └── app.js                 # 前端逻辑（6 页面：仪表盘/节点/订阅源/SubStore/日志/设置）
+├── Dockerfile                 # Docker 多阶段构建
+├── docker-compose.yml         # Docker Compose 配置
+├── .golangci.yml              # Lint 配置
+├── BUILDING.md                # 完整构建指南
+└── README.md                  # 本文件
 ```
 
 ## 核心特性
@@ -41,17 +50,40 @@ substore-ui-go/
 
 ## 构建
 
+详见 **[BUILDING.md](BUILDING.md)** — 完整构建指南（环境要求、命令、产物、常见问题）。
+
+快速开始：
+
+```bash
+# 使用 Make（推荐）
+make all          # 完整流程: precheck → test → build → verify
+
+# 或使用构建脚本
+bash scripts/build.sh all
+
+# 跨平台构建
+make cross        # 或 bash scripts/build.sh all-cross
+```
+
+产物位于 `./dist/` 目录。
+
+### 手动构建
+
 ```bash
 # Windows
-go build -o substore-ui-go.exe
+go build -ldflags "-s -w -X main.version=v1.1.0" -o dist/substore-ui-go.exe .
 
 # Linux
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o substore-ui-go-linux
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o dist/substore-ui-go-linux .
 ```
 
 ## Docker 部署
 
 ```bash
+# 方式一：docker-compose（推荐）
+docker-compose up -d --build
+
+# 方式二：手动
 docker build -t substore-ui-go .
 docker run -d --name substore-ui-go -p 8300:8300 substore-ui-go
 ```
@@ -71,7 +103,7 @@ docker run -d --name substore-ui-go -p 8300:8300 substore-ui-go
 
 - **后端**: Go 1.22+，仅依赖 `gopkg.in/yaml.v3`
 - **前端**: 原生 HTML/CSS/JS，无构建步骤
-- **测试**: Go 标准 `testing` 包，38 项测试全通过
+- **测试**: Go 标准 `testing` 包，39 项测试全通过
 
 ## 分支说明
 
