@@ -40,17 +40,17 @@ func (ss *SessionStore) Create(apiKey string) string {
 }
 
 // Get checks if a session exists and is valid, returning true if so.
+// Uses a single write lock to check + delete atomically, eliminating
+// the TOCTOU race that existed between RLock check and Lock delete.
 func (ss *SessionStore) Get(sid string) bool {
-	ss.mu.RLock()
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
 	entry, ok := ss.sessions[sid]
-	ss.mu.RUnlock()
 	if !ok {
 		return false
 	}
 	if time.Now().UnixMilli() > entry.expires {
-		ss.mu.Lock()
 		delete(ss.sessions, sid)
-		ss.mu.Unlock()
 		return false
 	}
 	return true

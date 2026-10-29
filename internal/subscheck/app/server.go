@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -385,9 +386,11 @@ func (a *SubStoreApp) exportHandler(c *gin.Context) {
 
 // ===== substore-ui-go API Handlers (adapted to Gin) =====
 
-func (a *SubStoreApp) handleHealth(c *gin.Context) {
+// buildHealthData constructs the shared health response payload used by
+// both /api/health and /api/dashboard. Extracted to avoid duplication.
+func (a *SubStoreApp) buildHealthData() gin.H {
 	stats := a.handlerApp.Stats.Snapshot()
-	c.JSON(http.StatusOK, gin.H{
+	return gin.H{
 		"service": "substore-ui-go",
 		"uptime":  int64(time.Since(startTime).Seconds()),
 		"stats": gin.H{
@@ -400,7 +403,11 @@ func (a *SubStoreApp) handleHealth(c *gin.Context) {
 			"subsCheck": fmt.Sprintf("http://%s:%d", a.cfg.SubsCheckHost, a.cfg.SubsCheckPort),
 			"subStore":  fmt.Sprintf("http://%s:%d%s", a.cfg.SubStoreHost, a.cfg.SubStorePort, a.cfg.SubStorePath),
 		},
-	})
+	}
+}
+
+func (a *SubStoreApp) handleHealth(c *gin.Context) {
+	c.JSON(http.StatusOK, a.buildHealthData())
 }
 
 func (a *SubStoreApp) handleCSRFToken(c *gin.Context) {
@@ -459,89 +466,89 @@ func (a *SubStoreApp) handleLogout(c *gin.Context) {
 }
 
 func (a *SubStoreApp) handleDashboard(c *gin.Context) {
-	stats := a.handlerApp.Stats.Snapshot()
+	healthData := a.buildHealthData()
 
-	healthData := gin.H{
-		"service": "substore-ui-go",
-		"uptime":  int64(time.Since(startTime).Seconds()),
-		"stats": gin.H{
-			"requests":     stats.Requests,
-			"errors":       stats.Errors,
-			"rateLimited":  stats.RateLimited,
-			"rateLimitMap": a.handlerApp.RateLimiter.Size(),
-		},
-		"upstream": gin.H{
-			"subsCheck": fmt.Sprintf("http://%s:%d", a.cfg.SubsCheckHost, a.cfg.SubsCheckPort),
-			"subStore":  fmt.Sprintf("http://%s:%d%s", a.cfg.SubStoreHost, a.cfg.SubStorePort, a.cfg.SubStorePath),
-		},
+	// Parallelize data gathering: results.json read, config read, and
+	// pipeline status collection each run in their own goroutine.
+	// The total latency is now bounded by the slowest operation rather
+	// than the sum of all three.
+	type dashboardResults struct {
+		nodeSummary   model.NodeSummary
+		sourceSummary model.SourceSummary
+		pipeline      model.PipelineStatus
 	}
 
-	// Node data from subs-check results
-	var nodeSummary model.NodeSummary
-	if resultsData, err := os.ReadFile(save.ResultsPath()); err == nil {
-		var results save.ResultsSnapshot
-		if json.Unmarshal(resultsData, &results) == nil && len(results.Nodes) > 0 {
-			nodeSummary = model.NodeSummary{
-				Total:     len(results.Nodes),
-				ByType:    map[string]int{},
-				Available: countAvailable(results.Nodes),
-			}
-			for _, n := range results.Nodes {
-				nodeSummary.ByType[n.Type]++
+	resCh := make(chan dashboardResults, 1)
+
+	go func() {
+		var nodeSummary model.NodeSummary
+		if resultsData, err := os.ReadFile(save.ResultsPath()); err == nil {
+			var results save.ResultsSnapshot
+			if json.Unmarshal(resultsData, &results) == nil && len(results.Nodes) > 0 {
+				nodeSummary = model.NodeSummary{
+					Total:     len(results.Nodes),
+					ByType:    map[string]int{},
+					Available: countAvailable(results.Nodes),
+				}
+				for _, n := range results.Nodes {
+					nodeSummary.ByType[n.Type]++
+				}
 			}
 		}
-	}
 
-	// Source data from config
-	var sourceSummary model.SourceSummary
-	if cfgData, err := service.ReadConfigFile(a.cfg.ConfigPath); err == nil {
-		sources := service.ParseSubUrls(cfgData)
-		sourceSummary = model.SourceSummary{
-			Total:   len(sources),
-			Enabled: len(sources),
-			List:    sources,
+		var sourceSummary model.SourceSummary
+		if cfgData, err := service.ReadConfigFile(a.cfg.ConfigPath); err == nil {
+			sources := service.ParseSubUrls(cfgData)
+			sourceSummary = model.SourceSummary{
+				Total:   len(sources),
+				Enabled: len(sources),
+				List:    sources,
+			}
 		}
-	}
 
-	// Pipeline status
-	pipeline := model.PipelineStatus{
-		Checking:   a.scApp.checking.Load(),
-		Available:  int(check.Available.Load()),
-		ProxyCount: int(check.ProxyCount.Load()),
-		SpeedPass:  int(check.SpeedOk.Load()),
-	}
+		pipeline := model.PipelineStatus{
+			Checking:   a.scApp.checking.Load(),
+			Available:  int(check.Available.Load()),
+			ProxyCount: int(check.ProxyCount.Load()),
+			SpeedPass:  int(check.SpeedOk.Load()),
+		}
+
+		resCh <- dashboardResults{nodeSummary, sourceSummary, pipeline}
+	}()
+
+	res := <-resCh
 
 	dashboard := gin.H{
 		"health":  healthData,
-		"nodes":   nodeSummary,
-		"sources": sourceSummary,
-		"status":  pipeline,
+		"nodes":   res.nodeSummary,
+		"sources": res.sourceSummary,
+		"status":  res.pipeline,
 	}
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "ok", "data": dashboard})
 }
 
 func (a *SubStoreApp) handleNodes(c *gin.Context) {
-	nodes := service.GetCachedNodes()
-	if nodes == nil {
+	nodes, err := service.FetchNodesWithSingleflight(func() ([]model.Node, error) {
 		statusCode, body, err := service.ProxyGet(c.Request.Context(), a.cfg.SubsCheckHost, a.cfg.SubsCheckPort, "/sub/all.yaml", a.cfg.APIKey)
 		if err != nil {
-			switch {
-			case errors.Is(err, service.ErrUpstreamTimeout):
-				c.JSON(http.StatusGatewayTimeout, gin.H{"code": 504001, "message": "上游服务响应超时"})
-			case errors.Is(err, service.ErrUpstreamUnreachable):
-				c.JSON(http.StatusBadGateway, gin.H{"code": 502001, "message": "上游服务不可达"})
-			default:
-				c.JSON(http.StatusBadGateway, gin.H{"code": 502002, "message": "拉取节点失败"})
-			}
-			return
+			return nil, err
 		}
 		if statusCode != http.StatusOK {
-			c.JSON(http.StatusBadGateway, gin.H{"code": 502002, "message": fmt.Sprintf("拉取节点失败: HTTP %d", statusCode)})
-			return
+			return nil, fmt.Errorf("upstream returned HTTP %d", statusCode)
 		}
-		nodes = service.ParseNodesFromYaml(string(body))
-		service.SetCachedNodes(nodes)
+		return service.ParseNodesFromYaml(string(body)), nil
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrUpstreamTimeout):
+			c.JSON(http.StatusGatewayTimeout, gin.H{"code": 504001, "message": "上游服务响应超时"})
+		case errors.Is(err, service.ErrUpstreamUnreachable):
+			c.JSON(http.StatusBadGateway, gin.H{"code": 502001, "message": "上游服务不可达"})
+		default:
+			c.JSON(http.StatusBadGateway, gin.H{"code": 502002, "message": "拉取节点失败"})
+		}
+		return
 	}
 
 	page := parseIntDefault(c.Query("page"), 1)
@@ -589,20 +596,6 @@ func (a *SubStoreApp) handleNodes(c *gin.Context) {
 	}
 	pagedNodes := nodes[offset:end]
 
-	respNodes := make([]model.Node, len(pagedNodes))
-	for i, n := range pagedNodes {
-		ipv6 := n.IPv6 || strings.Contains(n.Server, ":")
-		respNodes[i] = model.Node{
-			Name:    n.Name,
-			Type:    n.Type,
-			Server:  n.Server,
-			Port:    n.Port,
-			TLS:     n.TLS,
-			IPv6:    ipv6,
-			Network: n.Network,
-		}
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"code":    0,
 		"message": "ok",
@@ -612,7 +605,7 @@ func (a *SubStoreApp) handleNodes(c *gin.Context) {
 			"pageSize":   pageSize,
 			"totalPages": totalPages,
 			"byType":     byType,
-			"nodes":      respNodes,
+			"nodes":      pagedNodes,
 		},
 	})
 }
@@ -784,7 +777,11 @@ func modifySubUrls(lines []string, newURL string) []string {
 	}
 
 	if !foundEmptyArray && insertAt >= 0 {
-		lines = append(lines[:insertAt], append([]string{`  - "` + newURL + `"`}, lines[insertAt:]...)...)
+		// Insert in-place: extend, shift right, then place the new element.
+		// Single allocation vs. double-append's two allocations.
+		lines = append(lines, "")
+		copy(lines[insertAt+1:], lines[insertAt:])
+		lines[insertAt] = `  - "` + newURL + `"`
 	}
 
 	return lines
@@ -879,7 +876,9 @@ func countAvailable(nodes []save.NodeRecord) int {
 }
 
 func GenerateSimpleKey() string {
-	return fmt.Sprintf("%06d", time.Now().UnixNano()%1000000)
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("%x", b[:])
 }
 
 func ReadLastNLines(filePath string, n int) ([]string, error) {
@@ -901,8 +900,13 @@ func ReadLastNLines(filePath string, n int) ([]string, error) {
 	}
 
 	const chunkSize int64 = 8192
-	var buf []byte
+	var chunks [][]byte
 	off := size
+	newlineCount := 0
+
+	// Read backwards in chunks, collecting them without O(n²) copies.
+	// Each chunk is appended to the chunks slice (O(1) amortized),
+	// and newlines are counted per-chunk to avoid scanning the whole buffer.
 	for off > 0 {
 		readSize := chunkSize
 		if off < readSize {
@@ -914,19 +918,29 @@ func ReadLastNLines(filePath string, n int) ([]string, error) {
 		if _, err := f.ReadAt(tmp, off); err != nil && err != io.EOF {
 			return nil, err
 		}
-		buf = append(tmp, buf...)
+		chunks = append(chunks, tmp)
+		newlineCount += bytes.Count(tmp, []byte{'\n'})
 
-		if int64(bytes.Count(buf, []byte{'\n'})) > int64(n) {
+		if newlineCount > n {
 			break
 		}
 	}
 
-	buf = bytes.TrimRight(buf, "\n")
-	if len(buf) == 0 {
+	// Reassemble chunks in correct order (they were read backwards)
+	// using bytes.Buffer, which grows its internal slice geometrically
+	// (amortized O(n) total copies vs. the old append-to-front's O(n²)).
+	var buf bytes.Buffer
+	for i := len(chunks) - 1; i >= 0; i-- {
+		buf.Write(chunks[i])
+	}
+
+	bufBytes := buf.Bytes()
+	bufBytes = bytes.TrimRight(bufBytes, "\n")
+	if len(bufBytes) == 0 {
 		return nil, nil
 	}
 
-	lines := strings.Split(string(buf), "\n")
+	lines := strings.Split(string(bufBytes), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
