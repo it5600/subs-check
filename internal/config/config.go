@@ -13,6 +13,11 @@ type Config struct {
 	APIKey       string
 	CSRFTokenTTL int64 // milliseconds
 
+	// Gateway (Native FPK) mode
+	SocketPath     string // Unix socket path for gateway
+	GatewayPrefix  string // e.g. /app/trim.substore-ui-go
+	GatewayMode    bool   // When true, skip API key auth (gateway handles SSO)
+
 	SubsCheckHost string
 	SubsCheckPort int
 
@@ -37,11 +42,42 @@ type Config struct {
 
 // Load reads configuration from environment variables with sensible defaults
 func Load() *Config {
+	// Check if running in Native FPK gateway mode
+	socketPath := getEnv("SOCKET_PATH", "")
+	gatewayPrefix := getEnv("GATEWAY_PREFIX", "")
+	gatewayMode := socketPath != "" // Enable gateway mode when using Unix socket
+
+	// Default CORS origins for standalone mode; empty for gateway mode
+	corsOrigins := []string{
+		"https://ui.19840928.xyz",
+		"https://ui.19840928.xyz:16666",
+	}
+	if gatewayMode {
+		corsOrigins = []string{} // Gateway mode: same-origin only
+	}
+
+	// Default security headers
+	secHeaders := map[string]string{
+		"X-Content-Type-Options":    "nosniff",
+		"X-Frame-Options":           "DENY",
+		"X-XSS-Protection":          "1; mode=block",
+		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+	}
+	// In gateway/iframe mode, allow framing from fnOS desktop
+	if gatewayMode {
+		secHeaders["X-Frame-Options"] = "SAMEORIGIN"
+	}
+
 	return &Config{
 		Port:         getEnvInt("PORT", 8300),
 		Host:         getEnv("HOST", "0.0.0.0"),
 		APIKey:       getEnv("API_KEY", "hy584521"),
 		CSRFTokenTTL: 60 * 60 * 1000,
+
+		SocketPath:     socketPath,
+		GatewayPrefix:  gatewayPrefix,
+		GatewayMode:    gatewayMode,
 
 		SubsCheckHost: getEnv("SUBS_CHECK_HOST", "127.0.0.1"),
 		SubsCheckPort: getEnvInt("SUBS_CHECK_PORT", 8199),
@@ -60,18 +96,9 @@ func Load() *Config {
 		NodesPageSize: 100,
 		NodesMaxPage:  500,
 
-		CORSAllowedOrigins: []string{
-			"https://ui.19840928.xyz",
-			"https://ui.19840928.xyz:16666",
-		},
+		CORSAllowedOrigins: corsOrigins,
 
-		SecurityHeaders: map[string]string{
-			"X-Content-Type-Options":    "nosniff",
-			"X-Frame-Options":           "DENY",
-			"X-XSS-Protection":          "1; mode=block",
-			"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-			"Referrer-Policy":           "strict-origin-when-cross-origin",
-		},
+		SecurityHeaders: secHeaders,
 	}
 }
 

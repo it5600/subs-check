@@ -101,8 +101,19 @@ func CompareAPIKey(key, apiKey string) bool {
 	return subtle.ConstantTimeCompare([]byte(key), []byte(apiKey)) == 1
 }
 
-// CheckAuth validates authentication via Cookie Session or X-API-Key header
-func CheckAuth(r *http.Request, apiKey string, sessions *SessionStore) (bool, string) {
+// CheckAuth validates authentication via Cookie Session, X-API-Key header, or gateway header.
+// When gatewayMode is true, requests coming through the fnOS unified gateway
+// are trusted (the gateway itself handles authentication and passes user identity
+// via the X-Trim-Userid header).
+func CheckAuth(r *http.Request, apiKey string, sessions *SessionStore, gatewayMode bool) (bool, string) {
+	// 0. Gateway mode: fnOS unified gateway already authenticated the user
+	if gatewayMode {
+		// The gateway injects X-Trim-Userid for authenticated requests.
+		// A request without this header is unauthenticated (e.g. direct socket access).
+		if uid := r.Header.Get("X-Trim-Userid"); uid != "" {
+			return true, "gateway"
+		}
+	}
 	// 1. Cookie Session
 	cookie, err := r.Cookie("substore_sid")
 	if err == nil && cookie.Value != "" {

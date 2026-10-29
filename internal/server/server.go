@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +24,7 @@ type Server struct {
 	httpServer *http.Server
 	app        *handler.App
 	config     *config.Config
+	listener   net.Listener
 }
 
 // New creates a new server instance
@@ -35,10 +37,25 @@ func New(cfg *config.Config) *Server {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", middleware.LogRequest(http.HandlerFunc(s.handleRequest)))
+
+	// In gateway mode, strip the gateway prefix from URLs
+	if cfg.GatewayPrefix != "" {
+		prefix := cfg.GatewayPrefix
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// Strip gateway prefix for internal routing
+			if strings.HasPrefix(r.URL.Path, prefix) {
+				r.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
+				if r.URL.Path == "" {
+					r.URL.Path = "/"
+				}
+			}
+			middleware.LogRequest(http.HandlerFunc(s.handleRequest)).ServeHTTP(w, r)
+		})
+	} else {
+		mux.Handle("/", middleware.LogRequest(http.HandlerFunc(s.handleRequest)))
+	}
 
 	s.httpServer = &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -52,15 +69,47 @@ func New(cfg *config.Config) *Server {
 func (s *Server) Start() error {
 	go s.cleanupLoop()
 
+	// Use Unix socket in gateway mode, TCP otherwise
+	if s.config.SocketPath != "" {
+		// Remove existing socket file if any
+		_ = os.Remove(s.config.SocketPath)
+
+		listener, err := net.Listen("unix", s.config.SocketPath)
+		if err != nil {
+			return fmt.Errorf("failed to listen on socket: %w", err)
+		}
+		s.listener = listener
+		s.httpServer.Addr = "unix"
+
+		log.Printf("[substore-ui-go] 服务已启动 (Gateway 模式)")
+		log.Printf("  Socket: %s", s.config.SocketPath)
+		log.Printf("  网关前缀: %s", s.config.GatewayPrefix)
+		log.Printf("  subs-check: http://%s:%d", s.config.SubsCheckHost, s.config.SubsCheckPort)
+		log.Printf("  Sub-Store:  http://%s:%d%s", s.config.SubStoreHost, s.config.SubStorePort, s.config.SubStorePath)
+		log.Printf("  配置路径: %s", s.config.ConfigPath)
+
+		go s.gracefulShutdown()
+		return s.httpServer.Serve(listener)
+	}
+
+	// TCP mode
+	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", addr, err)
+	}
+	s.listener = listener
+	s.httpServer.Addr = addr
+
 	log.Printf("[substore-ui-go] 服务已启动")
-	log.Printf("  监听: %s:%d", s.config.Host, s.config.Port)
+	log.Printf("  监听: %s", addr)
 	log.Printf("  subs-check: http://%s:%d", s.config.SubsCheckHost, s.config.SubsCheckPort)
 	log.Printf("  Sub-Store:  http://%s:%d%s", s.config.SubStoreHost, s.config.SubStorePort, s.config.SubStorePath)
 	log.Printf("  配置路径: %s", s.config.ConfigPath)
 
 	go s.gracefulShutdown()
 
-	return s.httpServer.ListenAndServe()
+	return s.httpServer.Serve(listener)
 }
 
 // handleRequest is the main request handler
@@ -120,6 +169,13 @@ func (s *Server) gracefulShutdown() {
 		log.Printf("[substore-ui-go] 强制关闭: %v", err)
 		_ = s.httpServer.Close()
 	}
+
+	// Clean up Unix socket file if in gateway mode
+	if s.config.SocketPath != "" {
+		_ = os.Remove(s.config.SocketPath)
+		log.Printf("[substore-ui-go] 已清理 Socket: %s", s.config.SocketPath)
+	}
+
 	log.Println("[substore-ui-go] 服务已退出")
 }
 

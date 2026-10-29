@@ -117,7 +117,7 @@ func (a *App) HandleAPI(w http.ResponseWriter, r *http.Request, pathname string)
 	}
 
 	// Authentication check for all other /api/* endpoints
-	valid, _ := middleware.CheckAuth(r, a.Config.APIKey, a.Sessions)
+	valid, authType := middleware.CheckAuth(r, a.Config.APIKey, a.Sessions, a.Config.GatewayMode)
 	if !valid {
 		a.Stats.IncErrors()
 		WriteJSON(w, http.StatusUnauthorized, service.FormatError(401001, "未授权"))
@@ -125,11 +125,14 @@ func (a *App) HandleAPI(w http.ResponseWriter, r *http.Request, pathname string)
 	}
 
 	// CSRF check for write operations (POST/PATCH/DELETE)
-	if r.Method == http.MethodPost || r.Method == http.MethodDelete || r.Method == http.MethodPatch {
-		if !middleware.ValidateCSRFToken(r, a.Config.APIKey) {
-			a.Stats.IncErrors()
-			WriteJSON(w, http.StatusForbidden, service.FormatError(403003, "CSRF 校验失败，请刷新页面获取新的 Token"))
-			return
+	// Skip CSRF when authenticated via gateway (gateway handles its own CSRF)
+	if authType != "gateway" {
+		if r.Method == http.MethodPost || r.Method == http.MethodDelete || r.Method == http.MethodPatch {
+			if !middleware.ValidateCSRFToken(r, a.Config.APIKey) {
+				a.Stats.IncErrors()
+				WriteJSON(w, http.StatusForbidden, service.FormatError(403003, "CSRF 校验失败，请刷新页面获取新的 Token"))
+				return
+			}
 		}
 	}
 
