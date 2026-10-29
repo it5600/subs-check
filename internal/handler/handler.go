@@ -31,13 +31,6 @@ type Stats struct {
 	RateLimited int64
 }
 
-// StatsSnapshot is a zero-alloc struct return for Snapshot.
-type StatsSnapshot struct {
-	Requests    int64
-	Errors      int64
-	RateLimited int64
-}
-
 // IncRequests increments the total request counter.
 func (s *Stats) IncRequests() {
 	s.mu.Lock()
@@ -60,10 +53,10 @@ func (s *Stats) IncRateLimited() {
 }
 
 // Snapshot returns a copy of current statistics as a struct (no map allocation).
-func (s *Stats) Snapshot() StatsSnapshot {
+func (s *Stats) Snapshot() model.StatsSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return StatsSnapshot{
+	return model.StatsSnapshot{
 		Requests:    s.Requests,
 		Errors:      s.Errors,
 		RateLimited: s.RateLimited,
@@ -113,6 +106,12 @@ func (a *App) HandleAPI(w http.ResponseWriter, r *http.Request, pathname string)
 	// /api/logout - no auth required
 	if pathname == "/api/logout" {
 		a.handleLogout(w, r)
+		return
+	}
+
+	// /api/dashboard - aggregated data, no auth required (gateway mode handles SSO)
+	if pathname == "/api/dashboard" {
+		a.handleDashboard(w, r)
 		return
 	}
 
@@ -193,6 +192,91 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		},
 	}
 	WriteJSON(w, http.StatusOK, service.FormatOK(data))
+}
+
+// handleDashboard aggregates health + status + nodes + sources into a single response.
+// Reduces frontend from 3 round-trips to 1, improving load speed.
+func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	stats := a.Stats.Snapshot()
+
+	// 1. Health data
+	healthData := map[string]interface{}{
+		"service": "substore-ui-go",
+		"uptime":  int64(time.Since(startTime).Seconds()),
+		"stats": map[string]interface{}{
+			"requests":     stats.Requests,
+			"errors":       stats.Errors,
+			"rateLimited":  stats.RateLimited,
+			"rateLimitMap": a.RateLimiter.Size(),
+		},
+		"upstream": map[string]string{
+			"subsCheck": fmt.Sprintf("http://%s:%d", a.Config.SubsCheckHost, a.Config.SubsCheckPort),
+			"subStore":  fmt.Sprintf("http://%s:%d%s", a.Config.SubStoreHost, a.Config.SubStorePort, a.Config.SubStorePath),
+		},
+	}
+
+	// 2. Fetch node data (cached)
+	nodes := service.GetCachedNodes()
+	if nodes == nil {
+		statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/sub/all.yaml", a.Config.APIKey)
+		if err == nil && statusCode == http.StatusOK {
+			nodes = service.ParseNodesFromYaml(string(body))
+			service.SetCachedNodes(nodes)
+		}
+	}
+	var nodeSummary model.NodeSummary
+	if nodes != nil {
+		nodeSummary = model.NodeSummary{
+			Total:     len(nodes),
+			ByType:    map[string]int{},
+			Available: len(nodes), // all parsed nodes are available
+		}
+		for _, n := range nodes {
+			nodeSummary.ByType[n.Type]++
+		}
+	}
+
+	// 3. Fetch subscription sources
+	var sourceSummary model.SourceSummary
+	if cfg, err := service.ReadConfigFile(a.Config.ConfigPath); err == nil {
+		sources := service.ParseSubUrls(cfg)
+		sourceSummary = model.SourceSummary{
+			Total:   len(sources),
+			Enabled: len(sources),
+			List:    sources,
+		}
+	}
+
+	// 4. Try to fetch upstream status (non-blocking — best effort)
+	var pipeline model.PipelineStatus
+	if statusCode, body, err := service.ProxyGet(r.Context(), a.Config.SubsCheckHost, a.Config.SubsCheckPort, "/api/status", a.Config.APIKey); err == nil && statusCode == http.StatusOK {
+		var statusJSON struct {
+			Checking   bool `json:"checking"`
+			Available  int  `json:"available"`
+			ProxyCount int  `json:"proxyCount"`
+			Pipeline   struct {
+				SpeedPass int `json:"speedPass"`
+			} `json:"pipeline"`
+		}
+		if json.Unmarshal(body, &statusJSON) == nil {
+			pipeline = model.PipelineStatus{
+				Checking:   statusJSON.Checking,
+				Available:  statusJSON.Available,
+				ProxyCount: statusJSON.ProxyCount,
+				SpeedPass:  statusJSON.Pipeline.SpeedPass,
+			}
+		}
+	}
+
+	// Build aggregated response
+	dashboard := map[string]interface{}{
+		"health":  healthData,
+		"nodes":   nodeSummary,
+		"sources": sourceSummary,
+		"status":  pipeline,
+	}
+
+	WriteJSON(w, http.StatusOK, service.FormatOK(dashboard))
 }
 
 // handleCSRFToken generates a new CSRF token

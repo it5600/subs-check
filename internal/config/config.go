@@ -14,9 +14,9 @@ type Config struct {
 	CSRFTokenTTL int64 // milliseconds
 
 	// Gateway (Native FPK) mode
-	SocketPath     string // Unix socket path for gateway
-	GatewayPrefix  string // e.g. /app/trim.substore-ui-go
-	GatewayMode    bool   // When true, skip API key auth (gateway handles SSO)
+	SocketPath    string // Unix socket path for gateway
+	GatewayPrefix string // e.g. /app/trim.substore-ui-go
+	GatewayMode   bool   // When true, skip API key auth (gateway handles SSO)
 
 	SubsCheckHost string
 	SubsCheckPort int
@@ -75,9 +75,9 @@ func Load() *Config {
 		APIKey:       getEnv("API_KEY", "hy584521"),
 		CSRFTokenTTL: 60 * 60 * 1000,
 
-		SocketPath:     socketPath,
-		GatewayPrefix:  gatewayPrefix,
-		GatewayMode:    gatewayMode,
+		SocketPath:    socketPath,
+		GatewayPrefix: gatewayPrefix,
+		GatewayMode:   gatewayMode,
 
 		SubsCheckHost: getEnv("SUBS_CHECK_HOST", "127.0.0.1"),
 		SubsCheckPort: getEnvInt("SUBS_CHECK_PORT", 8199),

@@ -256,19 +256,20 @@
     statsEl.innerHTML = '<div class="loading-overlay"><div class="loading"></div><span>加载中...</span></div>';
 
     try {
-      const [health, status, nodes] = await Promise.all([
-        api.get('/api/health'),
-        api.get('/api/status'),
-        api.get('/api/nodes?pageSize=1'),
-      ]);
+      // 使用聚合端点，一次请求获取所有数据（从 3 次请求减少到 1 次）
+      const dash = await api.get('/api/dashboard');
+      const health = dash.health || {};
+      const nodes = dash.nodes || {};
+      const status = dash.status || {};
+      const sources = dash.sources || {};
+      const pipeline = status; // pipeline fields are merged into status
 
-      const pipeline = status.pipeline || {};
       const statCards = `
         <div class="stat-card" style="--accent-color: var(--color-success);">
           <div class="stat-card-row">
             <span class="icon">🟢</span>
             <div>
-              <div class="num">${status.available || 0}</div>
+              <div class="num">${status.available || nodes.available || 0}</div>
               <div class="label">存活节点</div>
             </div>
           </div>
@@ -277,7 +278,7 @@
           <div class="stat-card-row">
             <span class="icon">⚡</span>
             <div>
-              <div class="num">${pipeline.speedPass || 0}</div>
+              <div class="num">${status.speedPass || 0}</div>
               <div class="label">测速通过</div>
             </div>
           </div>
@@ -286,7 +287,7 @@
           <div class="stat-card-row">
             <span class="icon">🔗</span>
             <div>
-              <div class="num">${status.proxyCount || 0}</div>
+              <div class="num">${status.proxyCount || nodes.total || 0}</div>
               <div class="label">代理总数</div>
             </div>
           </div>
@@ -308,32 +309,53 @@
       const statusDot = document.getElementById('service-status-dot');
       const statusText = document.getElementById('service-status-text');
       if (statusDot && statusText) {
-        if (status.available != null && status.available > 0) {
+        if ((status.available || 0) > 0 || (nodes.available || 0) > 0) {
           statusDot.className = 'status-dot online';
-          statusText.textContent = `${status.available} 节点在线`;
+          statusText.textContent = `${status.available || nodes.available || 0} 节点在线`;
         } else {
           statusDot.className = 'status-dot offline';
           statusText.textContent = '服务异常';
         }
       }
 
-      // 节点概览
+      // 节点概览 — 增强：显示节点类型分布 + 延迟统计
       const byType = nodes.byType || {};
       const typeBadges = Object.entries(byType).slice(0, 8).map(([t, c]) =>
         `<span class="badge badge-gray">${utils.escapeHtml(t)}: ${c}</span>`
       ).join(' ');
+      const delayInfo = nodes.avgDelay != null
+        ? `<div class="text-xs text-muted mt-2">延迟: ${nodes.avgDelay.toFixed(0)}ms 平均 / ${nodes.minDelay.toFixed(0)}ms 最低 / ${nodes.maxDelay.toFixed(0)}ms 最高</div>`
+        : '';
       document.getElementById('node-overview').innerHTML = `
         <div class="stat-card" style="margin-bottom: 0.8rem; --accent-color: var(--color-accent);">
           <div class="stat-card-row">
             <span class="icon">🌐</span>
             <div>
-              <div class="num">${nodes.total}</div>
+              <div class="num">${nodes.total || 0}</div>
               <div class="label">总节点数</div>
             </div>
           </div>
         </div>
         <div class="flex flex-wrap gap-2">${typeBadges || '<span class="text-dim text-sm">无数据</span>'}</div>
+        ${delayInfo}
       `;
+
+      // 订阅源概览 — 新增：显示订阅源数量
+      const srcEl = document.getElementById('source-overview');
+      if (srcEl) {
+        srcEl.innerHTML = `
+          <div class="stat-card" style="margin-bottom: 0.6rem; --accent-color: var(--color-accent);">
+            <div class="stat-card-row">
+              <span class="icon">📡</span>
+              <div>
+                <div class="num">${sources.total || 0}</div>
+                <div class="label">订阅源</div>
+              </div>
+            </div>
+          </div>
+          <div class="text-xs text-muted">已启用: ${sources.enabled || 0}</div>
+        `;
+      }
 
       // Sub-Store 信息
       try {

@@ -25,3 +25,47 @@ type Response struct {
 	Message string      `json:"message"`
 	Data    interface{} `json:"data"`
 }
+
+// StatsSnapshot is the zero-alloc struct return for Stats.Snapshot().
+type StatsSnapshot struct {
+	Requests    int64 `json:"requests"`
+	Errors      int64 `json:"errors"`
+	RateLimited int64 `json:"rateLimited"`
+}
+
+// DashboardStats holds aggregated dashboard data
+type DashboardStats struct {
+	Service  string            `json:"service"`
+	Uptime   int64             `json:"uptime"`
+	Stats    StatsSnapshot     `json:"stats"`
+	Upstream map[string]string `json:"upstream"`
+
+	Nodes   NodeSummary    `json:"nodes"`
+	Sources SourceSummary  `json:"sources"`
+	Status  PipelineStatus `json:"status"`
+}
+
+// NodeSummary holds node distribution stats
+type NodeSummary struct {
+	Total     int            `json:"total"`
+	ByType    map[string]int `json:"byType"`
+	Available int            `json:"available"`
+	AvgDelay  float64        `json:"avgDelay"`
+	MinDelay  float64        `json:"minDelay"`
+	MaxDelay  float64        `json:"maxDelay"`
+}
+
+// SourceSummary holds subscription source stats
+type SourceSummary struct {
+	Total   int      `json:"total"`
+	Enabled int      `json:"enabled"`
+	List    []Source `json:"list"`
+}
+
+// PipelineStatus holds the upstream subs-check pipeline status
+type PipelineStatus struct {
+	Checking   bool `json:"checking"`
+	Available  int  `json:"available"`
+	ProxyCount int  `json:"proxyCount"`
+	SpeedPass  int  `json:"speedPass"`
+}
