@@ -29,6 +29,61 @@ type subEntry struct {
 	source string
 }
 
+// errPermanentSub 标记订阅源返回了「重试也不会改变结果」的永久错误（4xx）。
+// 用哨兵错误而非字符串匹配，调用方才能可靠地做熔断登记。
+var errPermanentSub = errors.New("订阅源永久失效")
+
+// failedSubCache 是进程内的失效订阅源临时黑名单。
+// 远程订阅清单常由第三方维护，个别链接会长期 404；每轮重复请求既浪费
+// 一次往返，也会持续刷 ERROR 日志。这里按 TTL 临时跳过，到期自动重试：
+// 上游修好后无需改配置即可自愈，远程清单的动态更新能力也得以保留。
+type failedSubCache struct {
+	mu sync.Mutex
+	m  map[string]time.Time // WarpUrl 规范化后的 URL -> 熔断到期时间
+}
+
+var deadSubs = failedSubCache{m: make(map[string]time.Time)}
+
+// subFailTTL 返回熔断时长；<=0 表示禁用熔断。
+func subFailTTL() time.Duration {
+	minutes := config.GlobalConfig.SubUrlFailTTL
+	if minutes <= 0 {
+		return 0
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// blocked 判断 URL 是否仍在熔断期，顺带清理已过期条目。
+func (c *failedSubCache) blocked(url string) bool {
+	if subFailTTL() <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	exp, ok := c.m[url]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(exp) {
+		return true
+	}
+	delete(c.m, url)
+	return false
+}
+
+// mark 登记一个永久失效订阅源，返回是否为新登记（用于只打一次日志）。
+func (c *failedSubCache) mark(url string) bool {
+	ttl := subFailTTL()
+	if ttl <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, existed := c.m[url]
+	c.m[url] = time.Now().Add(ttl)
+	return !existed
+}
+
 // ShardSpec 描述一次拉取的分片参数：每个订阅内每 Keep 个节点保留 1 个，从 Offset 开始。
 type ShardSpec struct {
 	Keep   int
@@ -100,7 +155,16 @@ func GetProxiesSharded(shard ShardSpec) ([]map[string]any, error) {
 			url := e.url
 			data, err := GetDateFromSubs(url)
 			if err != nil {
-				slog.Error("获取订阅链接错误跳过", "source", e.source, "url", url, "err", err)
+				if errors.Is(err, errPermanentSub) {
+					// 永久错误：登记熔断，之后 TTL 内由 resolveSubUrls 直接跳过。
+					// 只在首次登记时打一条 WARN，避免每轮刷屏。
+					if deadSubs.mark(url) {
+						slog.Warn("订阅源永久失效，已加入临时熔断", "source", e.source,
+							"url", url, "minutes", config.GlobalConfig.SubUrlFailTTL)
+					}
+				} else {
+					slog.Error("获取订阅链接错误跳过", "source", e.source, "url", url, "err", err)
+				}
 				return
 			}
 
@@ -230,9 +294,10 @@ func resolveSubUrls() ([]subEntry, int, int) {
 		}
 	}
 
-	// 规范化与去重
+	// 规范化、熔断过滤与去重
 	seen := make(map[string]struct{}, len(entries))
 	out := make([]subEntry, 0, len(entries))
+	blocked := 0
 	for _, e := range entries {
 		s := strings.TrimSpace(e.url)
 		if s == "" || strings.HasPrefix(s, "#") { // 跳过空行与注释
@@ -241,8 +306,16 @@ func resolveSubUrls() ([]subEntry, int, int) {
 		if _, ok := seen[s]; ok {
 			continue
 		}
+		// key 与拉取协程里实际请求的 URL 保持一致（都经过 WarpUrl）
+		if deadSubs.blocked(utils.WarpUrl(s)) {
+			blocked++
+			continue
+		}
 		seen[s] = struct{}{}
 		out = append(out, subEntry{url: s, source: e.source})
+	}
+	if blocked > 0 {
+		slog.Info("跳过熔断期内的订阅源", "count", blocked, "ttlMinutes", config.GlobalConfig.SubUrlFailTTL)
 	}
 	return out, localNum, remoteNum
 }
@@ -394,7 +467,8 @@ func GetDateFromSubs(subUrl string) ([]byte, error) {
 			// 运行日志里每轮都有失效订阅源重试 3 次后才报 404，
 			// 白白多 2 次请求 + 2 秒退避。这类错误立即返回。
 			if permanentHTTPStatus(resp.StatusCode) {
-				return nil, fmt.Errorf("订阅源永久失效(不重试): %w", lastErr)
+				// 保留原有错误文本，同时挂上哨兵供调用方识别并登记熔断
+				return nil, fmt.Errorf("%w(不重试): %w", errPermanentSub, lastErr)
 			}
 			continue
 		}

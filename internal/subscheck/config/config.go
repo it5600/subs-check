@@ -3,22 +3,22 @@ package config
 import _ "embed"
 
 type Config struct {
-	PrintProgress        bool      `yaml:"print-progress"`
-	IPv6                 bool      `yaml:"ipv6"`
-	Concurrent           int       `yaml:"concurrent"`
-	SpeedConcurrent      int       `yaml:"speed-concurrent"`
-	MediaConcurrent      int       `yaml:"media-concurrent"`
-	ShuffleTestOrder     bool      `yaml:"shuffle-test-order"`
-	CheckInterval        int       `yaml:"check-interval"`
-	CronExpression       string    `yaml:"cron-expression"`
-	AliveTestUrl         string    `yaml:"alive-test-url"`
-	SpeedTestUrl         string    `yaml:"speed-test-url"`
-	DownloadTimeout      int       `yaml:"download-timeout"`
-	DownloadMB           int       `yaml:"download-mb"`
-	TotalSpeedLimit      int       `yaml:"total-speed-limit"`
-	MinSpeed             int       `yaml:"min-speed"`
-	Timeout              int       `yaml:"timeout"`
-	AliveTimeout         int       `yaml:"alive-timeout"`
+	PrintProgress    bool   `yaml:"print-progress"`
+	IPv6             bool   `yaml:"ipv6"`
+	Concurrent       int    `yaml:"concurrent"`
+	SpeedConcurrent  int    `yaml:"speed-concurrent"`
+	MediaConcurrent  int    `yaml:"media-concurrent"`
+	ShuffleTestOrder bool   `yaml:"shuffle-test-order"`
+	CheckInterval    int    `yaml:"check-interval"`
+	CronExpression   string `yaml:"cron-expression"`
+	AliveTestUrl     string `yaml:"alive-test-url"`
+	SpeedTestUrl     string `yaml:"speed-test-url"`
+	DownloadTimeout  int    `yaml:"download-timeout"`
+	DownloadMB       int    `yaml:"download-mb"`
+	TotalSpeedLimit  int    `yaml:"total-speed-limit"`
+	MinSpeed         int    `yaml:"min-speed"`
+	Timeout          int    `yaml:"timeout"`
+	AliveTimeout     int    `yaml:"alive-timeout"`
 	// MemoryLimit 是 Go 堆的软上限(MB)，0 表示不限制。
 	MemoryLimit int `yaml:"memory-limit"`
 	// GCPercent 是 GC 阈值，0 表示沿用 Go 默认值(100)。
@@ -28,7 +28,7 @@ type Config struct {
 	// DeadNodeTTL 失效节点冷却时长（分钟），0 表示按检测间隔自动推算
 	DeadNodeTTL int `yaml:"dead-node-ttl"`
 	// FullCheckEvery 每 N 轮做一次全量检测(0=不启用)。
-	FullCheckEvery int `yaml:"full-check-every"`
+	FullCheckEvery       int       `yaml:"full-check-every"`
 	MediaCheckTimeout    int       `yaml:"media-check-timeout"`
 	SpeedEarlyStop       int       `yaml:"speed-early-stop"`
 	FilterRegex          string    `yaml:"filter-regex"`
@@ -51,6 +51,7 @@ type Config struct {
 	SubUrlsRetryInterval int       `yaml:"sub-urls-retry-interval"`
 	SubUrlsTimeout       int       `yaml:"sub-urls-timeout"`
 	SubUrlsConcurrent    int       `yaml:"sub-urls-concurrent"`
+	SubUrlFailTTL        int       `yaml:"sub-url-fail-ttl"`
 	SubUrlsGetUA         string    `yaml:"sub-urls-get-ua"`
 	SubUrlsRemote        []string  `yaml:"sub-urls-remote"`
 	SubUrls              []string  `yaml:"sub-urls"`
@@ -112,13 +113,15 @@ var GlobalConfig = &Config{
 	SubUrlsGetUA:       "clash.meta (https://substore-ui-go/internal/subscheck)",
 	SubUrlsReTry:       3,
 	SubUrlsConcurrent:  20,
+	// 永久失效订阅源（4xx）熔断时长，单位分钟；0 表示禁用熔断
+	SubUrlFailTTL: 1440,
 	// Fluxor 协同集成默认值
-	FluxorApiUrl:        "http://127.0.0.1:9091",
-	FluxorApiSecret:     "",
-	FluxorAutoReload:    true,
-	FluxorProviderName:  "subs-check",
-	FluxorDelayUrl:      "http://www.gstatic.com/generate_204",
-	FluxorDelayTimeout:  5000,
+	FluxorApiUrl:       "http://127.0.0.1:9091",
+	FluxorApiSecret:    "",
+	FluxorAutoReload:   true,
+	FluxorProviderName: "subs-check",
+	FluxorDelayUrl:     "http://www.gstatic.com/generate_204",
+	FluxorDelayTimeout: 5000,
 }
 
 //go:embed config.example.yaml

@@ -184,15 +184,24 @@
       const res = await fetch(apiUrl(path), opts);
       const json = await res.json();
 
+      // 后端 authMiddleware 的 401 响应体是 {"error":"无效的API密钥"}，不带 code 字段。
+      // 必须在下面的「裸 JSON 兼容」之前拦截：否则错误会被当成成功数据 return，
+      // loadDashboard() 拿错误对象渲染成空面板，且不会抛错 → 登录框永远不出现。
+      if (res.status === 401 || json.code === 401001) {
+        state.loggedIn = false;
+        state.csrfToken = null;
+        showLoginScreen();
+        throw new Error('未授权，请重新登录');
+      }
+
       if (json.code === 403003 && retry) {
         await this.getCsrfToken();
         return this.request(path, method, body, false);
       }
 
-      if (json.code === 401001) {
-        state.loggedIn = false;
-        showLoginScreen();
-        throw new Error('未授权，请重新登录');
+      // 其它非 2xx 且无 code 的响应同样不能被当成裸 JSON 数据返回。
+      if (!res.ok && json.code === undefined) {
+        throw new Error(json.error || json.message || `请求失败 (HTTP ${res.status})`);
       }
 
       // subs-check 原生端点（/api/logs、/api/config、/api/version 等）返回裸 JSON，

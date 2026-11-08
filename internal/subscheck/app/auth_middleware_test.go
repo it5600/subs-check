@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -99,5 +100,31 @@ func TestAuthMiddleware_SessionCannotWrite(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("Session 不应能执行写操作(期望 401), got %d", w.Code)
+	}
+}
+
+// 回归：合并面板 app.js 的 request() 只认 json.code === 401001 判定未授权。
+// authMiddleware 原本只返回 {"error":"无效的API密钥"}（无 code），前端会把这个 401
+// 当作「裸 JSON 成功数据」返回，导致登录框不显示、仪表盘空白。
+// 修复后 401 响应体必须带 code=401001，同时保留 error 兼容既有调用方。
+func TestAuthMiddleware_UnauthorizedBodyCarriesCode(t *testing.T) {
+	r, _ := newAuthProbe(t, middleware.NewSessionStore(60000))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("匿名访问应返回 401, got %d", w.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("401 响应体应为合法 JSON: %v; body=%s", err, w.Body.String())
+	}
+	if code, _ := body["code"].(float64); int(code) != 401001 {
+		t.Fatalf("401 响应体必须带 code=401001（旧前端据此弹登录框）, got %v; body=%s", body["code"], w.Body.String())
+	}
+	if body["error"] != "无效的API密钥" {
+		t.Fatalf("应保留 error 字段以兼容既有调用方, got %v", body["error"])
 	}
 }

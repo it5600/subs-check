@@ -7,7 +7,7 @@
 **不需要 clone 源码、不需要 Go 环境**。直接下载已构建的 FPK 安装包并校验后安装，
 完整步骤（下载直链、校验值、三种安装通道、验证清单、升级与回滚）见 **[INSTALL.md](INSTALL.md)**。
 
-- 最新 Release：`fpk-v1.4.9` → `trim.substore-ui-go-1.4.9.fpk`
+- 最新 Release：`fpk-v1.4.10` → `trim.substore-ui-go-1.4.10.fpk`
 - 打包骨架与自行构建指南：[fpk/README.md](fpk/README.md)
 - 应用入口：`/app/trim-substore-ui-go`（fnOS 统一网关，Unix Socket，无需开放端口）
 

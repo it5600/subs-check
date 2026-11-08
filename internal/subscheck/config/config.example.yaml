@@ -239,6 +239,10 @@ s3-bucket-lookup: "auto"
 sub-urls-retry: 3
 # 订阅下载并发数(控制同时拉取多少个订阅链接)
 sub-urls-concurrent: 20
+# 永久失效订阅源熔断时长(分钟)：返回 404/410/403 等 4xx 的订阅源会被临时跳过，
+# 期间不再发起请求、不再刷 ERROR 日志；到期后自动重新尝试，上游修好即可自愈。
+# 留空(不写此项)默认 1440 分钟(24 小时)；显式写 0 表示禁用熔断。
+sub-url-fail-ttl: 1440
 # 获取订阅时使用的UA；如果设置random将会使用随机UA获取订阅
 # sub-urls-get-ua: "random"
 sub-urls-get-ua: "clash.meta (https://github.com/beck-8/subs-check)"

@@ -1,4 +1,4 @@
-# 在另一台飞牛 NAS 上安装（FPK 1.4.9）
+# 在另一台飞牛 NAS 上安装（FPK 1.4.10）
 
 本项目把 `subs-check`（订阅节点测活）与 `Sub-Store`（订阅转换）合并为**单个 Go 二进制**，
 通过 fnOS 统一网关（Unix Socket）接入，无需开放安全入口。
@@ -9,22 +9,22 @@
 ## 1. 下载并校验
 
 ```bash
-FPK_URL="https://github.com/it5600/subs-check/releases/download/fpk-v1.4.9/trim.substore-ui-go-1.4.9.fpk"
-curl -fL --retry 2 -o /vol1/trim.substore-ui-go-1.4.9.fpk "$FPK_URL"
+FPK_URL="https://github.com/it5600/subs-check/releases/download/fpk-v1.4.10/trim.substore-ui-go-1.4.10.fpk"
+curl -fL --retry 2 -o /vol1/trim.substore-ui-go-1.4.10.fpk "$FPK_URL"
 
-stat -c %s /vol1/trim.substore-ui-go-1.4.9.fpk
-md5sum    /vol1/trim.substore-ui-go-1.4.9.fpk
-sha256sum /vol1/trim.substore-ui-go-1.4.9.fpk
+stat -c %s /vol1/trim.substore-ui-go-1.4.10.fpk
+md5sum    /vol1/trim.substore-ui-go-1.4.10.fpk
+sha256sum /vol1/trim.substore-ui-go-1.4.10.fpk
 ```
 
 | 项 | 值 |
 |---|---|
-| 文件名 | `trim.substore-ui-go-1.4.9.fpk` |
-| 大小 | `66922590` 字节（约 64 MB） |
-| MD5 | `75e6c3494330e910a864d914b1572a30` |
-| SHA256 | `ca4259ffff6e2cc1a709d4a44bc0413ee8025504d52198fea88e42acc2fb43fa` |
+| 文件名 | `trim.substore-ui-go-1.4.10.fpk` |
+| 大小 | `66924600` 字节（约 64 MB） |
+| MD5 | `619805ebc2c0aaae68c00f00bf9c6605` |
+| SHA256 | `c970c2a08fdcd82b42ef61c546f9d616915a6f22407f473ab1187f9125af3016` |
 | appname | `trim.substore-ui-go` |
-| 版本 | `1.4.9` |
+| 版本 | `1.4.10` |
 | 平台 / 最低系统 | `x86` / fnOS `1.1.3100` |
 
 **校验不通过立即停止安装**，不要用改名包或旧版本凑数。
@@ -34,10 +34,10 @@ sha256sum /vol1/trim.substore-ui-go-1.4.9.fpk
 ### A. trim-cli（已配置 OAuth profile）
 
 ```bash
-trim-cli --profile <profile> app install-fpk /vol1/trim.substore-ui-go-1.4.9.fpk \
+trim-cli --profile <profile> app install-fpk /vol1/trim.substore-ui-go-1.4.10.fpk \
   --volume-id <volumeId> --dry-run --yes          # 先预检，不启动安装任务
 
-trim-cli --profile <profile> app install-fpk /vol1/trim.substore-ui-go-1.4.9.fpk \
+trim-cli --profile <profile> app install-fpk /vol1/trim.substore-ui-go-1.4.10.fpk \
   --volume-id <volumeId> \
   --custom-parameters '[{"key":"wizard_port","value":"8300"}]' --yes
 ```
@@ -50,7 +50,7 @@ trim-cli --profile <profile> app install-fpk /vol1/trim.substore-ui-go-1.4.9.fpk
 
 ```bash
 appcenter-cli install-fpk --help     # 先确认本机 CLI 的实际参数
-appcenter-cli install-fpk /vol1/trim.substore-ui-go-1.4.9.fpk
+appcenter-cli install-fpk /vol1/trim.substore-ui-go-1.4.10.fpk
 ```
 
 ### C. 应用中心 Web UI（最稳兜底）
@@ -72,7 +72,7 @@ appcenter-cli install-fpk /vol1/trim.substore-ui-go-1.4.9.fpk
 
 ```bash
 # 1) 应用状态
-appcenter-cli status trim.substore-ui-go          # 期望 version=1.4.9, status=running
+appcenter-cli status trim.substore-ui-go          # 期望 version=1.4.10, status=running
 
 # 2) 启动版本
 grep '应用版本' /vol1/@appdata/trim.substore-ui-go/app.log | tail -1
@@ -86,25 +86,48 @@ curl -s -H "X-API-Key: <你的API Key>" "http://127.0.0.1:${PORT}/api/health"
 curl -s -H "X-API-Key: <你的API Key>" "http://127.0.0.1:${PORT}/api/status"
 ```
 
-`/api/status` 必须包含 `eta` / `elapsed` / `collectorPassed` 字段——这是 **1.4.9 独有的版本指纹**，
-可用来确认跑的不是旧二进制。另可比对
-`md5sum /vol1/@appcenter/trim.substore-ui-go/native/substore-ui-go-linux`
+**1.4.10 的版本指纹**（确认跑的不是旧二进制）：
+
+```bash
+# 不带凭据访问 dashboard，401 响应体必须同时含 code 与 error
+curl -s -i "http://127.0.0.1:${PORT}/api/dashboard" | head -20
+# 期望：HTTP/1.1 401 + {"code":401001,"message":"未授权","error":"无效的API密钥"}
+# 1.4.9 只有 error、没有 code —— 这正是面板空白、登录框不显示的根本原因。
+```
+
+`/api/status`（带 API Key）应含 `eta` / `elapsed` / `collectorPassed`（1.4.9 起提供）。
+另可比对 `md5sum /vol1/@appcenter/trim.substore-ui-go/native/substore-ui-go-linux`
 与 FPK 内 `app.tgz` 解出的同名文件。
 
 ## 5. 升级（已装旧版）
 
-fnOS 的 `install-fpk` **不会覆盖已存在的二进制**，只提示 `already installed`：
+fnOS 的 `install-fpk` **不会覆盖已存在的二进制**，只提示 `already installed`——
+直接「手动安装 FPK」装完仍是旧二进制，1.4.9 的面板空白问题不会消失。
+必须从 FPK 中解出新二进制强制覆盖：
 
 ```bash
+PKG=/vol1/trim.substore-ui-go-1.4.10.fpk      # 已下载并校验
+STAGE=/tmp/fpk1410
+BIN=/vol1/@appcenter/trim.substore-ui-go/native/substore-ui-go-linux
+
+# 外层 tar.gz 含 app.tgz；app.tgz 内路径是 native/substore-ui-go-linux（无 app/ 前缀）
+rm -rf "$STAGE" && mkdir -p "$STAGE"
+tar xzf "$PKG" -C "$STAGE" app.tgz
+tar xzf "$STAGE/app.tgz" -C "$STAGE" native/substore-ui-go-linux
+md5sum "$STAGE/native/substore-ui-go-linux"
+
 appcenter-cli stop trim.substore-ui-go
-cp /vol1/@appcenter/trim.substore-ui-go/native/substore-ui-go-linux{,.bak}   # 先备份
-cp -f <新二进制> /vol1/@appcenter/trim.substore-ui-go/native/substore-ui-go-linux
-chown substoreui:substoreui /vol1/@appcenter/trim.substore-ui-go/native/substore-ui-go-linux
-chmod 755 /vol1/@appcenter/trim.substore-ui-go/native/substore-ui-go-linux
+cp -a "$BIN" "$BIN.bak-1.4.9"
+cp -f "$STAGE/native/substore-ui-go-linux" "$BIN"
+chown substoreui:substoreui "$BIN"
+chmod 755 "$BIN"
+md5sum "$BIN"                                 # 必须与上面解出的 MD5 一致
 appcenter-cli start trim.substore-ui-go
+appcenter-cli status trim.substore-ui-go
 ```
 
 用 `md5sum` 验证内容，**不要用 mtime 判断新旧**（FPK 沿用 tar 内的时间戳）。
+升级后按第 4 节的 401 响应体验证新二进制确实生效，浏览器硬刷新应出现登录框。
 若卸载被拒，改走应用中心 Web UI。
 
 ## 6. 回滚与已知陷阱

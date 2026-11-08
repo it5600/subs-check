@@ -399,7 +399,13 @@ func (a *SubStoreApp) authMiddleware(key string) gin.HandlerFunc {
 				}
 			}
 		}
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的API密钥"})
+		// 响应体同时带 code，让只认 401001 的旧前端也能正确弹出登录框；
+		// 保留 error 字段以兼容既有调用方（如 curl 脚本、原生 admin.html）。
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"code":    401001,
+			"message": "未授权",
+			"error":   "无效的API密钥",
+		})
 	}
 }
 
