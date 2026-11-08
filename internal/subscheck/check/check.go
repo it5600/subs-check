@@ -2,6 +2,7 @@ package check
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -15,13 +16,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"substore-ui-go/internal/subscheck/check/platform"
-	"substore-ui-go/internal/subscheck/config"
-	proxyutils "substore-ui-go/internal/subscheck/proxy"
 	"github.com/juju/ratelimit"
 	"github.com/metacubex/mihomo/adapter"
 	_ "github.com/metacubex/mihomo/config" // init() sets dns.ParseNameServer, required by ParseProxy
 	"github.com/metacubex/mihomo/constant"
+	"substore-ui-go/internal/subscheck/check/platform"
+	"substore-ui-go/internal/subscheck/config"
+	"substore-ui-go/internal/subscheck/monitor"
+	proxyutils "substore-ui-go/internal/subscheck/proxy"
 )
 
 // Result 存储节点检测结果
@@ -74,7 +76,81 @@ var (
 	FilterPassed atomic.Uint32 // items that matched the filter and entered speed/collector
 	SpeedDone    atomic.Uint32 // checkSpeed completions (pass + fail)
 	SpeedOk      atomic.Uint32 // checkSpeed passes (also equals collector input when hasSpeedTest)
+	// CollectorPassed 是 collector 已收到的最终通过节点数，也是 SuccessLimit
+	// 实际比较的计数。它与 Available（测活通过数）不同：测速会淘汰大量节点，
+	// 因此不能用 Available 推断「是否已达到成功上限」，否则 ETA 会提前归零。
+	CollectorPassed atomic.Uint32
 )
+
+// 测活阶段统计：只在本轮结束时汇总输出一行，用来量化超时策略的收益。
+// buckets 依次为 <0.5s <1s <2s <3s <5s <8s <10s >=10s。
+var (
+	aliveStatOK      atomic.Uint32
+	aliveStatTimeout atomic.Uint32
+	aliveStatFastErr atomic.Uint32
+	aliveStatTotalMs atomic.Uint64
+	aliveStatBuckets [8]atomic.Uint32
+	aliveStageMs     atomic.Int64
+)
+
+func resetAliveStats() {
+	aliveStatOK.Store(0)
+	aliveStatTimeout.Store(0)
+	aliveStatFastErr.Store(0)
+	aliveStatTotalMs.Store(0)
+	aliveStageMs.Store(0)
+	for i := range aliveStatBuckets {
+		aliveStatBuckets[i].Store(0)
+	}
+}
+
+// recordAlive 记录一次测活结果：kind 为 ok / timeout / err。
+func recordAlive(elapsed time.Duration, kind string) {
+	ms := elapsed.Milliseconds()
+	aliveStatTotalMs.Add(uint64(ms))
+	switch kind {
+	case "ok":
+		aliveStatOK.Add(1)
+	case "timeout":
+		aliveStatTimeout.Add(1)
+	default:
+		aliveStatFastErr.Add(1)
+	}
+	switch {
+	case ms < 500:
+		aliveStatBuckets[0].Add(1)
+	case ms < 1000:
+		aliveStatBuckets[1].Add(1)
+	case ms < 2000:
+		aliveStatBuckets[2].Add(1)
+	case ms < 3000:
+		aliveStatBuckets[3].Add(1)
+	case ms < 5000:
+		aliveStatBuckets[4].Add(1)
+	case ms < 8000:
+		aliveStatBuckets[5].Add(1)
+	case ms < 10000:
+		aliveStatBuckets[6].Add(1)
+	default:
+		aliveStatBuckets[7].Add(1)
+	}
+}
+
+// aliveStatsSummary 返回一行测活统计摘要。
+func aliveStatsSummary() string {
+	ok := aliveStatOK.Load()
+	timeout := aliveStatTimeout.Load()
+	fastErr := aliveStatFastErr.Load()
+	total := int64(ok) + int64(timeout) + int64(fastErr)
+	avg := int64(0)
+	if total > 0 {
+		avg = int64(aliveStatTotalMs.Load()) / total
+	}
+	return fmt.Sprintf("测活统计: 通过=%d 超时=%d 快速失败=%d 平均=%dms 测活阶段=%ds 延迟分桶(<0.5s/<1s/<2s/<3s/<5s/<8s/<10s/>=10s)=%d/%d/%d/%d/%d/%d/%d/%d",
+		ok, timeout, fastErr, avg, aliveStageMs.Load()/1000,
+		aliveStatBuckets[0].Load(), aliveStatBuckets[1].Load(), aliveStatBuckets[2].Load(), aliveStatBuckets[3].Load(),
+		aliveStatBuckets[4].Load(), aliveStatBuckets[5].Load(), aliveStatBuckets[6].Load(), aliveStatBuckets[7].Load())
+}
 
 // PhaseResult 保存单个阶段的最终结果
 type PhaseResult struct {
@@ -148,6 +224,14 @@ func installPhaseCancel(cancel context.CancelFunc) func() {
 
 var Bucket *ratelimit.Bucket
 
+// CheckStartTime / CheckEndTime / CheckDuration 记录最近一轮检测的起止时间，
+// 供 /api/status 的 elapsed/duration 字段与 ETA 估算使用。
+var (
+	CheckStartTime time.Time
+	CheckEndTime   time.Time
+	CheckDuration  time.Duration
+)
+
 // effectiveConcurrency 计算阶段实际并发数
 func effectiveConcurrency(phaseConcurrency, fallback, itemCount int) int {
 	c := phaseConcurrency
@@ -180,7 +264,18 @@ func Check() ([]Result, error) {
 		slog.Info(fmt.Sprintf("添加历史待测节点，数量: %d", len(config.GlobalProxies)))
 		proxies = append(proxies, config.GlobalProxies...)
 	}
-	tmp, err := proxyutils.GetProxies()
+	// 降载：日常轮只检测一部分新节点，历史节点（上一轮可用节点）仍每轮全测，
+	// 每 full-check-every 轮再做一次全量检测，避免新节点漏检。
+	// 分片决策必须发生在拉取之前：分片在订阅内部生效，
+	// 未选中的节点不会进入节点表，加载期内存峰值也随之下降。
+	shard, shardNote := planCheckShare()
+	if shardNote != "" {
+		slog.Info(shardNote)
+	}
+	// 加载阶段临时收紧 GC 阈值：几秒内解析上千个订阅会产生上百 MB 临时对象，
+	// 堆峰值实测 154MB（活对象只有 13MB）。加载结束后由 ConfigureMemory 恢复配置值。
+	monitor.ConfigureMemory(config.GlobalConfig.MemoryLimit, loadGCPercent())
+	tmp, err := proxyutils.GetProxiesSharded(shard)
 	if err != nil {
 		return nil, fmt.Errorf("获取节点失败: %w", err)
 	}
@@ -193,17 +288,42 @@ func Check() ([]Result, error) {
 	proxies = proxyutils.DeduplicateProxies(proxies)
 	slog.Info(fmt.Sprintf("去重后节点数量: %d", len(proxies)))
 
+	// Drop subscription info entries (remaining traffic / expiry / official
+	// site / address lines) before dispatch. They appear as pseudo-proxies in
+	// some subscription formats and would waste a full alive check, often
+	// returning a misleading "node" that is just text. Mirrors proxyhub's
+	// isInfoNode: only skip when the item has no real server/port, so
+	// legitimate nodes whose display name happens to contain an info keyword
+	// are preserved.
+	proxies = filterInfoNodes(proxies)
+	slog.Info(fmt.Sprintf("过滤信息条目后节点数量: %d", len(proxies)))
+
+	// 节点表加载完成，把加载期的临时对象（订阅原文、解析中间态）还给操作系统，
+	// 否则常驻内存会一直停在加载峰值附近（实测加载后即占用 197MB）
+	monitor.ReleaseMemory()
+	slog.Info(monitor.Summary())
+
+	// 订阅来源统计要在轮次开始前算好：轮次中节点表会被逐步释放，
+	// 结束后没法再遍历整份节点表。
+	subTotals := countSubUrls(proxies)
+
+	// 内存软上限与 GC 阈值（配置改动下一轮生效）
+	monitor.ConfigureMemory(config.GlobalConfig.MemoryLimit, config.GlobalConfig.GCPercent)
+
 	checker := &ProxyChecker{
 		results: make([]Result, 0),
 	}
-	return checker.run(proxies)
+	return checker.run(proxies, subTotals)
 }
 
 // run drives the 4-stage pipeline: dispatch → alive → media+filter → speed → collect.
 // Stages run concurrently, connected by channels. SuccessLimit cancels the whole
 // pipeline as soon as the collector has gathered N passing items; in-flight work
 // is drained and un-dispatched items are discarded.
-func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
+func (pc *ProxyChecker) run(proxies []map[string]any, subTotals map[string]int) ([]Result, error) {
+	if subTotals == nil {
+		subTotals = countSubUrls(proxies)
+	}
 	if config.GlobalConfig.TotalSpeedLimit != 0 {
 		Bucket = ratelimit.NewBucketWithRate(float64(config.GlobalConfig.TotalSpeedLimit*1024*1024), int64(config.GlobalConfig.TotalSpeedLimit*1024*1024/10))
 	} else {
@@ -214,6 +334,7 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	slog.Info("当前参数", "timeout", config.GlobalConfig.Timeout, "enable-speedtest", config.GlobalConfig.SpeedTestUrl != "", "min-speed", config.GlobalConfig.MinSpeed, "download-timeout", config.GlobalConfig.DownloadTimeout, "download-mb", config.GlobalConfig.DownloadMB, "total-speed-limit", config.GlobalConfig.TotalSpeedLimit)
 
 	ResetPhaseResults()
+	resetAliveStats()
 
 	done := make(chan bool)
 	if config.GlobalConfig.PrintProgress {
@@ -227,6 +348,17 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	speedTestURL := config.GlobalConfig.SpeedTestUrl
 	hasSpeedTest := speedTestURL != ""
 	total := len(proxies)
+
+	// 冷却期内已确认超时的节点本轮不再重复测活（黑洞节点是整轮主要耗时来源）。
+	// 冷却时长默认按检测间隔推算：需要覆盖分片轮转周期（1/check-share 轮），
+	// 否则上一轮的黑洞节点会在本轮再次被完整超时一遍。
+	deadNodes.SetTTL(deadNodeTTLOf(config.GlobalConfig.DeadNodeTTL, config.GlobalConfig.CheckInterval))
+	if kept, skipped := deadNodes.Filter(proxies); skipped > 0 {
+		proxies = kept
+		total = len(proxies)
+		slog.Info(fmt.Sprintf("跳过冷却期内失效节点: %d, 剩余待测: %d, 失效节点缓存: %d, 冷却时长: %s",
+			skipped, total, deadNodes.Len(), deadNodes.TTL()))
+	}
 
 	aliveConcurrency := effectiveConcurrency(config.GlobalConfig.Concurrent, config.GlobalConfig.Concurrent, total)
 	mediaConcurrency := effectiveConcurrency(config.GlobalConfig.MediaConcurrent, config.GlobalConfig.Concurrent, total)
@@ -250,6 +382,25 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer installPhaseCancel(cancel)()
 
+	// ETA 预估：每 500ms 快照进度，用滑动窗口实时速率 + 历史速率融合估算剩余时间。
+	// ctx 取消时做最后一次估算供 /api/status 读取，goroutine 随整条流水线一起退出。
+	CheckStartTime = time.Now()
+	ResetETA()
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				UpdateETA()
+				return
+			case <-ticker.C:
+				SnapshotRate()
+				UpdateETA()
+			}
+		}
+	}()
+
 	// Channels sized to each stage's concurrency to keep buffering bounded.
 	aliveIn := make(chan aliveTask, aliveConcurrency)
 	mediaIn := make(chan mediaEntry, mediaConcurrency)
@@ -263,9 +414,14 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	// Dispatcher
 	go pipelineDispatch(ctx, proxies, aliveIn)
 
+	aliveStart := time.Now()
 	// Alive workers
 	aliveWg := pc.startAliveWorkers(ctx, aliveConcurrency, aliveIn, mediaIn)
-	go func() { aliveWg.Wait(); close(mediaIn) }()
+	go func() {
+		aliveWg.Wait()
+		aliveStageMs.Store(int64(time.Since(aliveStart).Milliseconds()))
+		close(mediaIn)
+	}()
 
 	// Media workers (filter runs inline on each passing item)
 	mediaWg := pc.startMediaWorkers(ctx, mediaConcurrency, mediaIn, speedIn, collectIn, hasSpeedTest, patterns)
@@ -295,6 +451,7 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 		r := item.r
 		out[item.idx] = &r
 		finalPassed++
+		CollectorPassed.Add(1)
 		if config.GlobalConfig.SuccessLimit > 0 && finalPassed >= config.GlobalConfig.SuccessLimit && !limitHit {
 			limitHit = true
 			cancel()
@@ -345,8 +502,23 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	}
 	slog.Info(fmt.Sprintf("可用节点数量: %d", len(pc.results)))
 	slog.Info(fmt.Sprintf("测试总消耗流量: %.3fGB", float64(TotalBytes.Load())/1024/1024/1024))
+	slog.Info(aliveStatsSummary())
+	slog.Info(fmt.Sprintf("测速提前结束次数: %d", platform.EarlyStopCount.Load()))
+	slog.Info(fmt.Sprintf("慢节点提前结束次数: %d", platform.SlowStopCount.Load()))
 
-	pc.checkSubscriptionSuccessRate(proxies)
+	pc.checkSubscriptionSuccessRate(subTotals)
+
+	CheckEndTime = time.Now()
+	CheckDuration = time.Since(CheckStartTime)
+	ETASeconds.Store(0) // 标记本轮结束：前端看到 eta=0 即表示完成/空闲
+	if CheckDuration > 0 {
+		// 记录本轮平均速率，供下一轮冷启动前 3 秒的融合估算使用
+		SetHistoricalRate(float64(Progress.Load()) / CheckDuration.Seconds())
+	}
+
+	// 一轮结束后把临时对象还给操作系统，避免常驻内存停在峰值
+	monitor.ReleaseMemory()
+	slog.Info(monitor.Summary())
 
 	return pc.results, nil
 }
@@ -404,6 +576,9 @@ func pipelineDispatch(ctx context.Context, proxies []map[string]any, out chan<- 
 			return
 		case out <- aliveTask{idx: i, proxy: proxies[i]}:
 		}
+		// 节点表逐个释放：检测完的节点不再被引用，Go 就能回收它们，
+		// 活跃堆不会一直背着上万个节点的配置（实测峰值内存明显下降）
+		proxies[i] = nil
 	}
 }
 
@@ -467,7 +642,7 @@ func (pc *ProxyChecker) startMediaWorkers(
 				if ctx.Err() != nil {
 					return
 				}
-				res := pc.checkMedia(entry.a)
+				res := pc.checkMedia(entry.a, ctx)
 				MediaDone.Add(1)
 				if res == nil || !MatchesFilter(*res, patterns) {
 					continue
@@ -525,23 +700,63 @@ func (pc *ProxyChecker) startSpeedWorkers(ctx context.Context, n int, in <-chan 
 }
 
 // checkAlive 检测单个代理是否存活
+// checkAlive 检测单个代理是否存活。
+// 超时口径由 alive-timeout 单独控制（毫秒，0 表示沿用 timeout）：
+// 测活阶段占整轮 95% 以上时间，绝大多数节点是"连不上"而不是"慢"，
+// 把测活超时单独调小可以在不牺牲存活节点的前提下压缩整轮耗时。
 func (pc *ProxyChecker) checkAlive(proxy map[string]any) *aliveResult {
 	if os.Getenv("SUB_CHECK_SKIP") != "" {
 		return &aliveResult{Proxy: proxy}
 	}
 
-	httpClient := CreateClient(proxy)
+	timeout := config.GlobalConfig.AliveTimeout
+	if timeout <= 0 {
+		timeout = config.GlobalConfig.Timeout
+	}
+
+	start := time.Now()
+	httpClient := CreateClientWithTimeout(proxy, timeout)
 	if httpClient == nil {
+		aliveStatFastErr.Add(1)
 		return nil
 	}
-	defer httpClient.Close()
-
 	alive, err := platform.CheckAlive(httpClient.Client)
-	if err != nil || !alive {
+	httpClient.Close()
+
+	if err != nil {
+		if isTimeoutError(err) {
+			recordAlive(time.Since(start), "timeout")
+			// 超时节点进入冷却，避免下一轮继续为黑洞节点付出完整超时时间
+			deadNodes.Mark(proxy)
+		} else {
+			recordAlive(time.Since(start), "err")
+		}
+		return nil
+	}
+	if !alive {
+		recordAlive(time.Since(start), "err")
 		return nil
 	}
 
+	recordAlive(time.Since(start), "ok")
+	// 恢复的节点立即解除冷却，保证能被重新纳入可用列表
+	deadNodes.Revive(proxy)
 	return &aliveResult{Proxy: proxy}
+}
+
+// isTimeoutError 判断错误是否属于超时类（连接/读写超时或客户端截止时间）。
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
 }
 
 // checkSpeed 对已有的 Result 执行测速。
@@ -561,7 +776,7 @@ func (pc *ProxyChecker) checkSpeed(r Result, speedTestURL string) *Result {
 	}
 	defer httpClient.Close()
 
-	speed, _, err := platform.CheckSpeed(httpClient.Client, Bucket, httpClient.BytesRead, speedTestURL)
+	speed, _, err := platform.CheckSpeed(httpClient.Client, Bucket, httpClient.BytesRead, speedTestURL, config.GlobalConfig.SpeedEarlyStop)
 	if err != nil || speed < config.GlobalConfig.MinSpeed {
 		return nil
 	}
@@ -573,7 +788,9 @@ func (pc *ProxyChecker) checkSpeed(r Result, speedTestURL string) *Result {
 // checkMedia 执行流媒体检测和必要的国家查询。
 // 不会丢弃节点,不会修改 proxy["name"];检测结果写入 Result 的结构化字段。
 // Counter updates are owned by the caller (media pipeline worker).
-func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
+// ctx 用于媒体重试的取消等待：检测任务一旦出队就完整跑完，但遇到
+// SuccessLimit/外部取消时不再等待后续重试退避。
+func (pc *ProxyChecker) checkMedia(a aliveResult, ctx context.Context) *Result {
 	res := &Result{Proxy: a.Proxy}
 
 	if os.Getenv("SUB_CHECK_SKIP") != "" {
@@ -610,7 +827,16 @@ func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
 				mediaWg.Add(1)
 				go func() {
 					defer mediaWg.Done()
-					if region, _ := platform.CheckYoutube(mediaClient); region != "" {
+					var region string
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						region, e = platform.CheckYoutube(mediaClient)
+						return e
+					})
+					if err != nil {
+						slog.Debug(fmt.Sprintf("YouTube 检测失败: %v", err))
+					}
+					if region != "" {
 						res.Youtube = region
 					}
 				}()
@@ -618,21 +844,46 @@ func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
 				mediaWg.Add(1)
 				go func() {
 					defer mediaWg.Done()
-					nf, _ := platform.CheckNetflix(mediaClient)
+					var nf *platform.NetflixResult
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						nf, e = platform.CheckNetflix(mediaClient)
+						return e
+					})
+					if err != nil {
+						slog.Debug(fmt.Sprintf("Netflix 检测失败: %v", err))
+					}
 					res.Netflix = nf
 				}()
 			case "disney":
 				mediaWg.Add(1)
 				go func() {
 					defer mediaWg.Done()
-					d, _ := platform.CheckDisney(mediaClient)
+					var d *platform.DisneyResult
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						d, e = platform.CheckDisney(mediaClient)
+						return e
+					})
+					if err != nil {
+						slog.Debug(fmt.Sprintf("Disney 检测失败: %v", err))
+					}
 					res.Disney = d
 				}()
 			case "gemini":
 				mediaWg.Add(1)
 				go func() {
 					defer mediaWg.Done()
-					if region, _ := platform.CheckGemini(mediaClient); region != "" {
+					var region string
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						region, e = platform.CheckGemini(mediaClient)
+						return e
+					})
+					if err != nil {
+						slog.Debug(fmt.Sprintf("Gemini 检测失败: %v", err))
+					}
+					if region != "" {
 						res.Gemini = region
 					}
 				}()
@@ -640,7 +891,16 @@ func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
 				mediaWg.Add(1)
 				go func() {
 					defer mediaWg.Done()
-					if region, _ := platform.CheckClaude(mediaClient); region != "" {
+					var region string
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						region, e = platform.CheckClaude(mediaClient)
+						return e
+					})
+					if err != nil {
+						slog.Debug(fmt.Sprintf("Claude 检测失败: %v", err))
+					}
+					if region != "" {
 						res.Claude = region
 					}
 				}()
@@ -648,7 +908,16 @@ func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
 				mediaWg.Add(1)
 				go func() {
 					defer mediaWg.Done()
-					if region, _ := platform.CheckSpotify(mediaClient); region != "" {
+					var region string
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						region, e = platform.CheckSpotify(mediaClient)
+						return e
+					})
+					if err != nil {
+						slog.Debug(fmt.Sprintf("Spotify 检测失败: %v", err))
+					}
+					if region != "" {
 						res.Spotify = region
 					}
 				}()
@@ -662,7 +931,12 @@ func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
 					}
 					res.IP = ip
 					res.Country = country
-					risk, err := platform.CheckIPRisk(mediaClient, ip)
+					var risk string
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						risk, e = platform.CheckIPRisk(mediaClient, ip)
+						return e
+					})
 					if err == nil {
 						res.IPRisk = risk
 					} else {
@@ -673,7 +947,16 @@ func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
 				mediaWg.Add(1)
 				go func() {
 					defer mediaWg.Done()
-					if region, _ := platform.CheckTikTok(mediaClient); region != "" {
+					var region string
+					err := withMediaRetry(ctx, func() error {
+						var e error
+						region, e = platform.CheckTikTok(mediaClient)
+						return e
+					})
+					if err != nil {
+						slog.Debug(fmt.Sprintf("TikTok 检测失败: %v", err))
+					}
+					if region != "" {
 						res.TikTok = region
 					}
 				}()
@@ -734,23 +1017,77 @@ func (pc *ProxyChecker) resetPhaseCounters(count int) {
 	FilterPassed.Store(0)
 	SpeedDone.Store(0)
 	SpeedOk.Store(0)
+	CollectorPassed.Store(0)
+}
+
+// roundSeq 记录已启动的检测轮次，用于分片调度。
+var (
+	roundSeq atomic.Int64
+	shardSeq atomic.Int64
+)
+
+// loadGCPercent 返回加载阶段使用的 GC 阈值。
+// 订阅解析阶段临时对象极多，用更激进的阈值压住堆峰值；
+// 加载结束后由 ConfigureMemory 恢复为配置里的阈值。
+func loadGCPercent() int {
+	const limit = 25
+	p := config.GlobalConfig.GCPercent
+	if p <= 0 || p > limit {
+		return limit
+	}
+	return p
+}
+
+// planCheckShare 决定本轮的分片参数，在拉取订阅之前调用。
+// 历史节点（config.GlobalProxies，来自 keep-days 快照，即上一轮可用节点）
+// 不参与分片，每轮都测，保证输出的可用节点不会缩水。
+// 每 full-check-every 轮做一次全量检测，保证新节点最多 N 轮内被发现一次。
+func planCheckShare() (proxyutils.ShardSpec, string) {
+	share := config.GlobalConfig.CheckShare
+	every := config.GlobalConfig.FullCheckEvery
+	if share <= 0 || share >= 1 || every <= 0 {
+		return proxyutils.ShardSpec{}, ""
+	}
+	seq := roundSeq.Add(1)
+	if seq%int64(every) == 0 {
+		return proxyutils.ShardSpec{}, fmt.Sprintf("分片检测: 本轮为全量检测(第 %d 轮)", seq)
+	}
+	n := int(math.Round(1 / share))
+	if n < 1 {
+		n = 1
+	}
+	// 分片序号只在分片轮递增：全量轮不占用分片序号，
+	// 保证任意连续 n 个分片轮里每个节点都会被覆盖一次
+	offset := int(shardSeq.Add(1) % int64(n))
+	return proxyutils.ShardSpec{Keep: n, Offset: offset},
+		fmt.Sprintf("分片检测: 本轮按每订阅 1/%d 取样(第 %d 轮, 偏移 %d), 每 %d 轮全量一次", n, seq, offset, every)
+}
+
+// countSubUrls 统计各订阅来源的节点总数。
+func countSubUrls(proxies []map[string]any) map[string]int {
+	out := make(map[string]int)
+	for _, proxy := range proxies {
+		if subUrl, ok := proxy["sub_url"].(string); ok {
+			out[subUrl]++
+		}
+	}
+	return out
 }
 
 // checkSubscriptionSuccessRate 检查订阅成功率并发出警告
-func (pc *ProxyChecker) checkSubscriptionSuccessRate(allProxies []map[string]any) {
+func (pc *ProxyChecker) checkSubscriptionSuccessRate(subTotals map[string]int) {
 	// 统计每个订阅的节点总数和成功数
 	subStats := make(map[string]struct {
 		total   int
 		success int
 	})
 
-	// 统计所有节点的订阅来源
-	for _, proxy := range allProxies {
-		if subUrl, ok := proxy["sub_url"].(string); ok {
-			stats := subStats[subUrl]
-			stats.total++
-			subStats[subUrl] = stats
-		}
+	// 各订阅的节点总数在轮次开始前已统计好
+	for subUrl, total := range subTotals {
+		subStats[subUrl] = struct {
+			total   int
+			success int
+		}{total: total}
 	}
 
 	// 统计成功节点的订阅来源
@@ -822,6 +1159,11 @@ type ProxyClient struct {
 }
 
 func CreateClient(mapping map[string]any) *ProxyClient {
+	return CreateClientWithTimeout(mapping, config.GlobalConfig.Timeout)
+}
+
+// CreateClientWithTimeout 创建带指定请求超时（毫秒）的代理客户端。
+func CreateClientWithTimeout(mapping map[string]any, timeoutMs int) *ProxyClient {
 	proxy, err := adapter.ParseProxy(mapping)
 	if err != nil {
 		slog.Debug("创建mihomo Client失败", "proxy", mapping["name"], "err", err)
@@ -858,7 +1200,7 @@ func CreateClient(mapping map[string]any) *ProxyClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	pc := &ProxyClient{
 		Client: &http.Client{
-			Timeout:   time.Duration(config.GlobalConfig.Timeout) * time.Millisecond,
+			Timeout:   time.Duration(timeoutMs) * time.Millisecond,
 			Transport: baseTransport,
 		},
 		proxy:     proxy,

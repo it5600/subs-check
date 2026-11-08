@@ -1,0 +1,12 @@
+{
+  "data-share": {
+    "shares": [
+      {
+        "name": "trim.substore-ui-go/config",
+        "permission": {
+          "rw": ["substoreui"]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+# 构建产物不入库：单个二进制约 116 MB、FPK 约 64 MB，
+# GitHub 单个 blob 上限 100 MB，误提交会导致 push 被拒收。
+app/native/substore-ui-go-linux
+app/native/*.bak*
+dist/
+*.fpk
+
+# 本地 fnpack 工具（从官方下载后放在 scripts/ 或加入 PATH）
+fnpack
+fnpack.exe
+scripts/fnpack
+
+# Python 缓存
+__pycache__/
+*.pyc

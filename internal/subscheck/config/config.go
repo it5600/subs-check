@@ -18,7 +18,19 @@ type Config struct {
 	TotalSpeedLimit      int       `yaml:"total-speed-limit"`
 	MinSpeed             int       `yaml:"min-speed"`
 	Timeout              int       `yaml:"timeout"`
+	AliveTimeout         int       `yaml:"alive-timeout"`
+	// MemoryLimit 是 Go 堆的软上限(MB)，0 表示不限制。
+	MemoryLimit int `yaml:"memory-limit"`
+	// GCPercent 是 GC 阈值，0 表示沿用 Go 默认值(100)。
+	GCPercent int `yaml:"gc-percent"`
+	// CheckShare 日常轮次只检测这个比例的新拉取节点(0<值<1)，1 或 0 表示每轮全量。
+	CheckShare float64 `yaml:"check-share"`
+	// DeadNodeTTL 失效节点冷却时长（分钟），0 表示按检测间隔自动推算
+	DeadNodeTTL int `yaml:"dead-node-ttl"`
+	// FullCheckEvery 每 N 轮做一次全量检测(0=不启用)。
+	FullCheckEvery int `yaml:"full-check-every"`
 	MediaCheckTimeout    int       `yaml:"media-check-timeout"`
+	SpeedEarlyStop       int       `yaml:"speed-early-stop"`
 	FilterRegex          string    `yaml:"filter-regex"`
 	SaveMethod           string    `yaml:"save-method"`
 	WebDAVURL            string    `yaml:"webdav-url"`
@@ -45,6 +57,12 @@ type Config struct {
 	SuccessRate          float32   `yaml:"success-rate"`
 	MihomoApiUrl         string    `yaml:"mihomo-api-url"`
 	MihomoApiSecret      string    `yaml:"mihomo-api-secret"`
+	FluxorApiUrl         string    `yaml:"fluxor-api-url"`
+	FluxorApiSecret      string    `yaml:"fluxor-api-secret"`
+	FluxorAutoReload     bool      `yaml:"fluxor-auto-reload"`
+	FluxorProviderName   string    `yaml:"fluxor-provider-name"`
+	FluxorDelayUrl       string    `yaml:"fluxor-delay-api"`
+	FluxorDelayTimeout   int       `yaml:"fluxor-delay-timeout"`
 	ListenPort           string    `yaml:"listen-port"`
 	RenameNode           bool      `yaml:"rename-node"`
 	OutputDir            string    `yaml:"output-dir"`
@@ -94,6 +112,13 @@ var GlobalConfig = &Config{
 	SubUrlsGetUA:       "clash.meta (https://substore-ui-go/internal/subscheck)",
 	SubUrlsReTry:       3,
 	SubUrlsConcurrent:  20,
+	// Fluxor 协同集成默认值
+	FluxorApiUrl:        "http://127.0.0.1:9091",
+	FluxorApiSecret:     "",
+	FluxorAutoReload:    true,
+	FluxorProviderName:  "subs-check",
+	FluxorDelayUrl:      "http://www.gstatic.com/generate_204",
+	FluxorDelayTimeout:  5000,
 }
 
 //go:embed config.example.yaml

@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# 卸载回调：按用户选择决定是否清理共享数据
+
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null
+}
+
+if [ "${wizard_data_action}" = "delete" ]; then
+    DATA_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+
+    # 安全护栏：只允许删除系统为本应用创建的 data-share 目录。
+    # TRIM_DATA_SHARE_PATHS 由 fnOS 按 config/resource 的声明注入，正常情况
+    # 形如 /vol1/@appshare/<appname>/<share>。若变量为空、为 "/"、为根卷
+    # 或不含 appname 前缀，说明环境异常，此时拒绝删除并只记日志——
+    # 宁可残留数据，也不能误删用户其他目录。
+    is_safe_share_dir() {
+        local p="$1"
+        [ -n "$p" ] || return 1
+        case "$p" in
+            "/"|""|"/vol1"|"/vol1/"|"/vol2"|"/vol2/"|"/vol1/@appshare"|"/vol1/@appshare/") return 1 ;;
+        esac
+        case "$p" in
+            */@appshare/*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    if is_safe_share_dir "${DATA_DIR}"; then
+        log_msg "删除共享数据目录: ${DATA_DIR}"
+        rm -rf "${DATA_DIR}" 2>/dev/null
+    else
+        log_msg "警告：共享目录路径异常，跳过删除: ${DATA_DIR}"
+    fi
+    rm -rf "${TRIM_PKGVAR}" 2>/dev/null
+    log_msg "数据已清理"
+else
+    log_msg "保留数据，卸载完成"
+fi
+
+exit 0

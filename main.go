@@ -2,24 +2,35 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"substore-ui-go/internal/config"
 	"substore-ui-go/internal/middleware"
+	"substore-ui-go/internal/subscheck/assets"
 	scapp "substore-ui-go/internal/subscheck/app"
+	"substore-ui-go/internal/subscheck/check"
 	"github.com/gin-gonic/gin"
 )
 
-const version = "1.0.0"
+// version 由构建时 -ldflags "-X main.version=..." 注入，便于在日志中确认运行版本
+var version = "1.0.0"
+
+// buildTime 由构建时 -ldflags "-X main.buildTime=..." 注入
+var buildTime = "unknown"
 
 func main() {
 	cfg := config.Load()
+
+	slog.Info("应用版本", "version", version, "build", buildTime)
 
 	// Create merged application
 	mergedApp := scapp.NewMergedApp(cfg, version)
@@ -62,16 +73,24 @@ func main() {
 		handler = &prefixStripper{prefix: strings.TrimSuffix(prefix, "/"), next: router}
 	}
 
-	// Wrap the handler chain so every response carries the security headers
-	// and every request is logged. Both were previously defined but never
-	// attached to the router, leaving the configuration dead.
+	// Wrap the handler chain so every response carries the security headers,
+	// every request is logged, and text responses are gzip-compressed when the
+	// client accepts it (frontend bundles shrink 60-80% over NAS LAN).
 	handler = middleware.SecurityHeadersHandler(cfg.SecurityHeaders, handler)
-	handler = middleware.LogRequest(handler)
+	handler = middleware.LogRequest(handler, cfg.AccessLogPath)
+	handler = middleware.GzipCompress(handler)
+
+	// Graceful shutdown: register signal handler so that SIGTERM/SIGINT
+	// stops the HTTP server gracefully (draining in-flight requests)
+	// before the process exits. This prevents the gateway from seeing
+	// 502s on the last few requests during a fnOS app upgrade.
+	srv := newHTTPServer(handler)
+	go signalHandler(srv, mergedApp)
 
 	if cfg.SocketPath != "" {
-		go serveUnixSocket(handler, cfg.SocketPath)
+		go serveUnixSocket(srv, cfg.SocketPath)
 	} else {
-		go serveTCP(handler, cfg)
+		go serveTCP(srv, cfg)
 	}
 
 	// Run subs-check main loop (triggerCheck, cron/ticker)
@@ -117,42 +136,21 @@ func (p *prefixStripper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveTCP starts the HTTP server on a TCP address.
-//
-// ReadHeaderTimeout is deliberately set (rather than ReadTimeout) so that
-// slow-loris style clients that trickle the header are rejected, while slow
-// but legitimate bodies (large config uploads) are still allowed to finish.
-func serveTCP(handler http.Handler, cfg *config.Config) {
+func serveTCP(srv *http.Server, cfg *config.Config) {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	srv.Addr = addr
 	slog.Info(fmt.Sprintf("HTTP服务器启动，监听 %s", addr))
-	server := &http.Server{
-		Addr:    addr,
-		Handler: handler,
-		ReadHeaderTimeout: 15 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
-	if err := server.ListenAndServe(); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		slog.Error(fmt.Sprintf("HTTP服务器启动失败: %v", err))
 	}
 }
 
 // serveUnixSocket starts the HTTP server on a Unix domain socket.
-//
-// This is the transport the fnOS unified gateway uses for Native FPK
-// applications: the gateway owns the public HTTPS endpoint and forwards
-// requests to this socket, which means the application needs no dedicated
-// TCP port and inherits the gateway's login/SSO handling.
-//
-// The socket file is removed first because a leftover file from a previous
-// (crashed) run would make Listen fail with "address already in use".
-func serveUnixSocket(handler http.Handler, socketPath string) {
+func serveUnixSocket(srv *http.Server, socketPath string) {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		slog.Warn(fmt.Sprintf("清理旧 socket 文件失败: %v", err))
 	}
 
-	// Create the parent directory when it does not exist yet.
 	if dir := socketParent(socketPath); dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			slog.Error(fmt.Sprintf("创建 socket 目录失败: %v", err))
@@ -166,17 +164,59 @@ func serveUnixSocket(handler http.Handler, socketPath string) {
 		return
 	}
 
-	// The gateway connects as a different user than the one running the
-	// application, so the socket has to be group/other accessible.
 	if err := os.Chmod(socketPath, 0660); err != nil {
 		slog.Warn(fmt.Sprintf("设置 socket 权限失败: %v", err))
 	}
 
 	slog.Info(fmt.Sprintf("Unix Socket 监听启动: %s", socketPath))
 
-	server := &http.Server{Handler: handler}
-	if err := server.Serve(listener); err != nil {
+	if err := srv.Serve(listener); err != nil {
 		slog.Error(fmt.Sprintf("Unix Socket 服务异常退出: %v", err))
+	}
+}
+
+// signalHandler listens for SIGTERM/SIGINT and initiates graceful shutdown
+// of the HTTP server, then stops the subs-check loop.
+func signalHandler(srv *http.Server, _ *scapp.SubStoreApp) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+	sig := <-sigChan
+	slog.Info(fmt.Sprintf("收到退出信号: %v，开始优雅关闭", sig))
+
+	// Cancel any running check pipeline first.
+	check.RequestCancel()
+
+	// Shutdown HTTP server with 10s timeout to drain in-flight requests.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error(fmt.Sprintf("HTTP 服务器关闭超时: %v", err))
+	} else {
+		slog.Info("HTTP 服务器已优雅关闭")
+	}
+
+	// 停止内嵌的 sub-store 进程：不停掉它会占着 8298 端口，
+	// 下次启动会因 EADDRINUSE 而崩溃重启循环。
+	assets.StopSubStore()
+
+	os.Exit(0)
+}
+
+// newHTTPServer builds an http.Server with hardened timeouts applied to both
+// TCP and unix-socket listeners. ReadHeaderTimeout is deliberately set (rather
+// than ReadTimeout) so that slow-loris style clients that trickle the header
+// are rejected, while slow but legitimate bodies (large config uploads) are
+// still allowed to finish.
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 }
 

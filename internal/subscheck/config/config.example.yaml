@@ -30,6 +30,18 @@ success-limit: 0
 
 # 超时时间(毫秒)(节点的最大延迟)
 timeout: 5000
+# 测活阶段专用超时(毫秒)，0表示沿用timeout。
+# 测活阶段占整轮 95% 以上时间，绝大多数节点是连不上而不是慢；
+# 单独调小可以在几乎不损失存活节点的前提下压缩整轮耗时。
+alive-timeout: 0
+# Go 堆软上限(MB)，0为不限制；超限后 GC 会更积极，降低常驻内存
+memory-limit: 0
+# GC 阈值，0为Go默认值(100)；调小更省内存，CPU开销略增
+gc-percent: 0
+# 日常轮次只检测这个比例的新拉取节点(0~1)，1或0=每轮全量
+check-share: 0
+# 每 N 轮做一次全量检测(0=不启用)
+full-check-every: 0
 # 延迟测试URL
 # 一些高级用法需要自己摸索，比如想要拒绝某些CF类节点，可将url替换为https://www.cloudflare.com
 alive-test-url: http://gstatic.com/generate_204
@@ -45,6 +57,9 @@ download-timeout: 10
 download-mb: 20
 # 总下载速度速度限制(MB/s)，0为不限
 total-speed-limit: 0
+# 测速提前结束阈值(KB/s)，0为关闭。已下载足够数据且实测速率超过该阈值时
+# 提前结束下载——是否达标的结论不会再变，可省下流量与时间。
+speed-early-stop: 0
 
 # 监听端口，用于直接返回节点信息，方便订阅转换
 # http://127.0.0.1:8199/all.yaml
@@ -169,6 +184,22 @@ sub-store-push-service: ""
 # 防止网络不好，所以现在内置，依赖:8199端口
 # 如果你想替换其他的自定义覆写文件，自己命名后放在output目录，然后更改此URL后缀即可
 mihomo-overwrite-url: "http://127.0.0.1:8199/sub/ACL4SSR_Online_Full.yaml"
+
+# ===== Fluxor 协同集成 =====
+# Fluxor (mihomo) 控制器 API 地址，用于可观测性与自动热重载
+# Fluxor 外部控制器端口默认 9091（经 socat 桥接到 unix socket）
+fluxor-api-url: "http://127.0.0.1:9091"
+# Fluxor API 密钥（mihomo external-controller-secret），无则留空
+fluxor-api-secret: ""
+# 每轮检测完成后是否自动热重载 Fluxor provider（零断流更新节点）
+fluxor-auto-reload: true
+# 需要热重载的 provider 名称（Fluxor config.yaml 中 proxy-providers 的键名）
+fluxor-provider-name: "subs-check"
+# /api/fluxor/delay 未指定 url 时使用的探测地址（需无需认证即可返回 204）
+fluxor-delay-api: "http://www.gstatic.com/generate_204"
+# 延迟测试超时（毫秒）
+fluxor-delay-timeout: 5000
+
 
 # 保存方法
 # 目前支持的保存方法: r2, local, gist, webdav, s3

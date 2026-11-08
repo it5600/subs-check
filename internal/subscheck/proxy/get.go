@@ -16,12 +16,12 @@ import (
 	"sync"
 	"time"
 
-	"substore-ui-go/internal/subscheck/config"
-	"substore-ui-go/internal/subscheck/utils"
 	"github.com/metacubex/mihomo/common/convert"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
+	"substore-ui-go/internal/subscheck/config"
+	"substore-ui-go/internal/subscheck/utils"
 )
 
 type subEntry struct {
@@ -29,7 +29,41 @@ type subEntry struct {
 	source string
 }
 
+// ShardSpec 描述一次拉取的分片参数：每个订阅内每 Keep 个节点保留 1 个，从 Offset 开始。
+type ShardSpec struct {
+	Keep   int
+	Offset int
+}
+
+// applyShard 按分片参数在单个订阅内取样。
+// 节点数不超过分母的小订阅整体保留，避免某些轮次整份订阅被跳过。
+func applyShard(list []map[string]any, shard ShardSpec) []map[string]any {
+	if shard.Keep <= 1 || len(list) <= shard.Keep {
+		return list
+	}
+	out := make([]map[string]any, 0, len(list)/shard.Keep+1)
+	for i, p := range list {
+		if i%shard.Keep == shard.Offset {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ApplyShardForTest 导出的分片实现，供跨包单测覆盖取样逻辑。
+func ApplyShardForTest(list []map[string]any, shard ShardSpec) []map[string]any {
+	return applyShard(list, shard)
+}
+
+// GetProxies 拉取并解析全部订阅节点。
 func GetProxies() ([]map[string]any, error) {
+	return GetProxiesSharded(ShardSpec{})
+}
+
+// GetProxiesSharded 拉取订阅，并在每个订阅内部按分片参数取样后再合并。
+// 分片下沉到订阅内部的目的：未选中的节点不会进入节点表，
+// 加载阶段的内存峰值随之下降（实测此前加载期峰值 165MB+）。
+func GetProxiesSharded(shard ShardSpec) ([]map[string]any, error) {
 
 	// 解析本地与远程订阅清单
 	subUrls, localNum, remoteNum := resolveSubUrls()
@@ -102,7 +136,7 @@ func GetProxies() ([]map[string]any, error) {
 					}
 					local = append(local, proxy)
 				}
-				buckets[i] = local
+				buckets[i] = applyShard(local, shard)
 				return
 			}
 
@@ -143,7 +177,7 @@ func GetProxies() ([]map[string]any, error) {
 					local = append(local, proxyMap)
 				}
 			}
-			buckets[i] = local
+			buckets[i] = applyShard(local, shard)
 		}(idx, subEntry{url: utils.WarpUrl(subUrl.url), source: subUrl.source})
 	}
 
@@ -157,7 +191,13 @@ func GetProxies() ([]map[string]any, error) {
 	}
 	mihomoProxies := make([]map[string]any, 0, total)
 	for _, b := range buckets {
-		mihomoProxies = append(mihomoProxies, b...)
+		for _, proxy := range b {
+			// 清理 mihomo 不认识的字段（如 client-fingerprint: unsafe），
+			// 否则每轮都会刷 "wrong clientFingerprint" 警告，导出的 YAML 里
+			// 也会带上这个非法值。
+			sanitizeProxy(proxy)
+			mihomoProxies = append(mihomoProxies, proxy)
+		}
 	}
 
 	return mihomoProxies, nil
@@ -242,6 +282,67 @@ func fetchRemoteSubUrls(listURL string) ([]string, error) {
 	return res, nil
 }
 
+// subTransport is a shared http.Transport reused across all subscription
+// fetches. All subscription URLs travel through the same network path, so
+// sharing one connection pool eliminates redundant TCP+TLS handshakes per
+// URL (previously each GetDateFromSubs call built its own Transport).
+var subTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true,
+	},
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+// initSubTransport configures the shared transport once, based on the current
+// config. Called lazily on first use to avoid referencing config before it is
+// loaded. Proxy resolution order:
+//  1. If Proxy is set → use it as HTTP proxy (typically Fluxor 7890)
+//  2. Else fall back to environment proxy (http.ProxyFromEnvironment)
+//  3. DNS.Enable still configures DialContext for mihomo DNS resolution
+var subTransportInit sync.Once
+
+func initSubTransport(timeoutSec int) {
+	subTransportInit.Do(func() {
+		// Configure proxy: prefer explicit Proxy config, then env.
+		if cfg := config.GlobalConfig; cfg.Proxy != "" {
+			proxyURL, err := u.Parse(cfg.Proxy)
+			if err == nil {
+				subTransport.Proxy = http.ProxyURL(proxyURL)
+				slog.Info("订阅拉取代理已启用", "proxy", cfg.Proxy)
+			} else {
+				slog.Warn("Proxy 配置无效，回退到环境代理", "proxy", cfg.Proxy, "err", err)
+			}
+		} else {
+			subTransport.Proxy = http.ProxyFromEnvironment
+		}
+
+		// DNS routing via mihomo if enabled
+		if config.GlobalConfig.DNS.Enable {
+			subTransport.DialContext = newMihomoDialer(time.Duration(timeoutSec) * time.Second)
+		}
+	})
+}
+
+// permanentHTTPStatus 判断某个 HTTP 状态码是否属于「重试也不会改变结果」。
+// 4xx 中 408（请求超时）与 429（限流）是暂时性的，仍可重试；
+// 5xx、网络错误、3xx（此处非 200 一律当失败）也不在此列，交给调用方重试。
+func permanentHTTPStatus(code int) bool {
+	if code < 400 || code >= 500 {
+		return false
+	}
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	default:
+		return true
+	}
+}
+
 // 订阅链接中获取数据
 func GetDateFromSubs(subUrl string) ([]byte, error) {
 	maxRetries := config.GlobalConfig.SubUrlsReTry
@@ -257,25 +358,11 @@ func GetDateFromSubs(subUrl string) ([]byte, error) {
 	}
 	var lastErr error
 
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	// Route DNS through the configured mihomo resolver so subscription domains aren't leaked to system DNS.
-	// Only when user enabled custom DNS — keeps default behavior unchanged for existing users.
-	if config.GlobalConfig.DNS.Enable {
-		transport.DialContext = newMihomoDialer(time.Duration(timeout) * time.Second)
-	}
+	// Reuse the shared transport (connection pooling across all subscriptions).
+	initSubTransport(timeout)
 	client := &http.Client{
 		Timeout:   time.Duration(timeout) * time.Second,
-		Transport: transport,
+		Transport: subTransport,
 	}
 
 	for i := range maxRetries {
@@ -300,9 +387,15 @@ func GetDateFromSubs(subUrl string) ([]byte, error) {
 			lastErr = err
 			continue
 		}
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("返回状态码: %d", resp.StatusCode)
+			// 永久性错误（404/410/403 等）重试多少次都不会变；
+			// 运行日志里每轮都有失效订阅源重试 3 次后才报 404，
+			// 白白多 2 次请求 + 2 秒退避。这类错误立即返回。
+			if permanentHTTPStatus(resp.StatusCode) {
+				return nil, fmt.Errorf("订阅源永久失效(不重试): %w", lastErr)
+			}
 			continue
 		}
 

@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# 升级后回调：以新版本重启
+sleep 1
+bash "${0%/*}/main" start 2>/dev/null
+exit 0

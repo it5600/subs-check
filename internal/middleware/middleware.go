@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -218,25 +221,74 @@ func SecurityHeadersHandler(headers map[string]string, next http.Handler) http.H
 
 // LogRequest wraps the response to log request completion with timing info.
 // Reference: net/http server access-log pattern (stdlib's internal logging).
-func LogRequest(next http.Handler) http.Handler {
+// When logPath is non-empty, logs are written as structured JSON lines to that file
+// (creating parent dirs if needed); otherwise to stdout as plain text.
+func LogRequest(next http.Handler, logPath string) http.Handler {
+	// Lazily open the log file only when a path is provided.
+	var (
+		fileMu sync.Mutex
+		file   *os.File
+		err    error
+	)
+
+	openFile := func() {
+		if logPath == "" {
+			return
+		}
+		fileMu.Lock()
+		defer fileMu.Unlock()
+		if file != nil {
+			return
+		}
+		dir := filepath.Dir(logPath)
+		if dir != "" {
+			os.MkdirAll(dir, 0o755)
+		}
+		file, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.Printf("[WARN] 无法打开访问日志文件 %s: %v（回退到 stdout）", logPath, err)
+			logPath = ""
+		}
+	}
+
+	writeJSON := func(entry map[string]any) {
+		openFile()
+		if logPath == "" {
+			// Fallback: stdout plain text
+			log.Printf("[%s] %s %s -> %d (%dms) [%s]",
+				entry["time"], entry["method"], entry["path"],
+				entry["status"], entry["duration_ms"], entry["remote"])
+			return
+		}
+		fileMu.Lock()
+		defer fileMu.Unlock()
+		if file == nil {
+			return
+		}
+		data, _ := json.Marshal(entry)
+		file.Write(data)
+		file.Write([]byte("\n"))
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-
-		// Wrap ResponseWriter to capture status
 		wrapped := &responseWriter{ResponseWriter: w}
 		next.ServeHTTP(wrapped, r)
-
 		duration := time.Since(start)
 		status := wrapped.status
 
-		log.Printf("[%s] %s %s -> %d (%dms) [%s]",
-			time.Now().Format("2006-01-02 15:04:05"),
-			r.Method,
-			r.URL.Path,
-			status,
-			duration.Milliseconds(),
-			r.RemoteAddr,
-		)
+		writeJSON(map[string]any{
+			"time":        time.Now().Format("2006-01-02T15:04:05.000Z07:00"),
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"query":       r.URL.RawQuery,
+			"status":      status,
+			"duration_ms": duration.Milliseconds(),
+			"remote":      r.RemoteAddr,
+			"remote_ip":   func() string { host, _, _ := net.SplitHostPort(r.RemoteAddr); return host }(),
+			"proto":       r.Proto,
+			"ua":          r.UserAgent(),
+		})
 	})
 }
 

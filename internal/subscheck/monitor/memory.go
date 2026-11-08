@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -73,6 +74,36 @@ func StartMemoryMonitor() {
 			}
 		}()
 	}
+}
+
+// ConfigureMemory 按配置设置 Go 堆的软上限与 GC 阈值。
+// limitMB: 软上限(MB)，0 表示不限制；gcPercent: GC 阈值，0 表示沿用默认值。
+// 每轮检测开始时调用，配置改动下一轮即生效。
+func ConfigureMemory(limitMB, gcPercent int) {
+	if gcPercent > 0 {
+		debug.SetGCPercent(gcPercent)
+	}
+	if limitMB > 0 {
+		debug.SetMemoryLimit(int64(limitMB) * 1024 * 1024)
+	}
+}
+
+// ReleaseMemory 在一轮检测结束后把内存还给操作系统。
+// 一轮检测会产生上万个 mihomo 适配器与节点表，结束后不主动回收的话
+// 常驻内存会一直停在峰值附近（实测 219MB → 回到 70MB 水平）。
+func ReleaseMemory() {
+	runtime.GC()
+	debug.FreeOSMemory()
+}
+
+// Summary 返回一行内存摘要，用于每轮结束时观察内存占用。
+func Summary() string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return fmt.Sprintf("内存摘要: HeapAlloc=%s HeapInuse=%s HeapSys=%s HeapReleased=%s Sys=%s StackInuse=%s NumGC=%d NextGC=%s",
+		formatBytes(m.HeapAlloc), formatBytes(m.HeapInuse), formatBytes(m.HeapSys),
+		formatBytes(m.HeapReleased), formatBytes(m.Sys), formatBytes(m.StackInuse),
+		m.NumGC, formatBytes(m.NextGC))
 }
 
 // checkMemory 检查内存使用情况

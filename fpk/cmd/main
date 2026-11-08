@@ -1,0 +1,227 @@
+#!/bin/bash
+
+# substore-ui-go + subs-check 合并应用 — fnOS FPK 生命周期脚本
+#
+# 单一二进制同时承载：
+#   - subs-check 节点测活核心（含内嵌 Sub-Store 服务）
+#   - Sub-Store 管理面板（前端 + API）
+#
+# 运行时使用 fnOS 统一网关的 Unix Socket 接入（app.sock），
+# 因此不占用任何 TCP 端口，也无需开放安全入口。
+
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+SOCKET_FILE="${TRIM_APPDEST}/app.sock"
+APP_DIR="${TRIM_APPDEST}/native"
+BIN="${APP_DIR}/substore-ui-go-linux"
+
+# 网关前缀与 socket 文件名必须与 app/ui/config 中的声明一致
+# 注意：fnOS 要求网关前缀不含 "."（appname 中的点需转为连字符），
+# 例如 appname=trim.substore-ui-go 对应 /app/trim-substore-ui-go
+GATEWAY_PREFIX="/app/trim-substore-ui-go"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+# ---------- 端口解析：settings.conf > 环境变量 > 默认值 ----------
+resolve_port() {
+    local port=""
+    if [ -f "${TRIM_PKGETC}/settings.conf" ]; then
+        # shellcheck disable=SC1090
+        . "${TRIM_PKGETC}/settings.conf" 2>/dev/null
+        port="${PORT:-}"
+    fi
+    if [ -z "${port}" ]; then
+        port="${TRIM_SERVICE_PORT:-8300}"
+    fi
+    echo "${port}"
+}
+
+# ---------- 数据目录 ----------
+# TRIM_DATA_SHARE_PATHS 形如 /vol1/@appshare/<appname>/<share>
+# 取第一个共享目录作为配置根目录，配置与产出都放在这里，用户可直接编辑。
+resolve_data_dir() {
+    local first="${TRIM_DATA_SHARE_PATHS%%:*}"
+    if [ -z "${first}" ] || [ "${first}" = ":" ]; then
+        first="${TRIM_PKGVAR}"
+    fi
+    echo "${first}"
+}
+
+prepare_env() {
+    export SUBS_CONFIG_PATH
+    SUBS_CONFIG_PATH="$(resolve_data_dir)/config.yaml"
+
+    export PUBLIC_DIR="${APP_DIR}/www"
+    export SOCKET_PATH="${SOCKET_FILE}"
+    export GATEWAY_PREFIX
+    export HOST="127.0.0.1"
+    export PORT="$(resolve_port)"
+
+    # API Key：优先取 settings.conf，其次取环境变量，最后沿用历史默认值
+    if [ -z "${API_KEY:-}" ]; then
+        if [ -f "${TRIM_PKGETC}/settings.conf" ]; then
+            local saved=""
+            saved=$(grep -E '^API_KEY=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | tail -n 1 | cut -d= -f2-)
+            export API_KEY="${saved:-hy584521}"
+        else
+            export API_KEY="hy584521"
+        fi
+    fi
+
+    # 内嵌 Sub-Store 服务端口（与既有部署保持一致）
+    export SUB_STORE_PORT="${SUB_STORE_PORT:-8298}"
+    export SUBS_CHECK_PORT="${SUBS_CHECK_PORT:-8198}"
+    export SUBS_CHECK_HOST="${SUBS_CHECK_HOST:-127.0.0.1}"
+
+    # 结构化访问日志：写入配置目录（与 config.yaml 同目录）
+    # 用 SUBS_CONFIG_PATH 推导，避免依赖 TRIM_PKGVAR 环境变量传递
+    export ACCESS_LOG_PATH="$(dirname "${SUBS_CONFIG_PATH}")/access.log"
+    mkdir -p "$(dirname "${ACCESS_LOG_PATH}")" 2>/dev/null || true
+    # 注意：不要导出 SUB_STORE_PATH。Go 二进制会自行解码内嵌的
+    # sub-store.bundle.js 到输出目录并用它启动 Node.js；若设置该变量
+    # （尤其指向不存在的随机路径），会覆盖正确的脚本路径导致启动失败。
+}
+
+start_app() {
+    if status_app >/dev/null 2>&1; then
+        log_msg "进程已在运行，跳过启动"
+        return 0
+    fi
+
+    if [ ! -x "${BIN}" ]; then
+        echo "应用二进制不存在或不可执行: ${BIN}" > "${TRIM_TEMP_LOGFILE}"
+        log_msg "启动失败：二进制缺失 ${BIN}"
+        return 1
+    fi
+
+    prepare_env
+
+    # 清理可能残留的 socket 文件，否则 bind 会失败
+    rm -f "${SOCKET_FILE}"
+
+    mkdir -p "${TRIM_PKGVAR}" "$(dirname "${SUBS_CONFIG_PATH}")" 2>/dev/null || true
+
+    cd "${APP_DIR}" || return 1
+
+    # 日志轮转：app.log 超过 5MB 时保留一份历史，避免长期运行后无限增长
+    if [ -f "${LOG_FILE}" ]; then
+        local log_size
+        log_size="$(stat -c %s "${LOG_FILE}" 2>/dev/null || echo 0)"
+        case "${log_size}" in
+            ''|*[!0-9]*) log_size=0 ;;
+        esac
+        if [ "${log_size}" -gt 5242880 ]; then
+            mv -f "${LOG_FILE}" "${LOG_FILE}.1"
+            log_msg "app.log 超过 5MB，已轮转为 app.log.1"
+        fi
+    fi
+
+    log_msg "启动中 pid_dir=${APP_DIR} socket=${SOCKET_FILE} port=${PORT} config=${SUBS_CONFIG_PATH}"
+
+    # setsid 会 fork 出子进程，$! 拿到的是 setsid 自身的 PID（随即退出），
+    # 因此这里改用 `setsid --fork` + exec 的方式，让 shell 直接拿到真实 PID。
+    # 备选方案：不使用 setsid，改用 nohup + disown，同样由 $! 给出真实 PID。
+    nohup "${BIN}" >> "${LOG_FILE}" 2>&1 < /dev/null &
+    local pid=$!
+    echo "${pid}" > "${PID_FILE}"
+
+    # 等待 socket 就绪，确认进程真的起来了
+    local i
+    for i in $(seq 1 20); do
+        sleep 1
+        if [ -S "${SOCKET_FILE}" ]; then
+            log_msg "启动成功 pid=${pid}，socket 已就绪"
+            echo "substore-ui-go started (pid=${pid}, socket=${SOCKET_FILE})"
+            return 0
+        fi
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            echo "应用启动失败，请检查 ${LOG_FILE}" > "${TRIM_TEMP_LOGFILE}"
+            log_msg "启动失败，进程已退出"
+            rm -f "${PID_FILE}"
+            return 1
+        fi
+    done
+
+    log_msg "警告：socket 未在 20 秒内就绪"
+    echo "substore-ui-go started (pid=${pid})，socket 未就绪，请检查 ${LOG_FILE}"
+    return 0
+}
+
+stop_app() {
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid=$(cat "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            log_msg "发送 TERM 信号到 pid=${pid}"
+            kill -TERM "${pid}" 2>/dev/null
+            local i
+            for i in $(seq 1 10); do
+                kill -0 "${pid}" 2>/dev/null || break
+                sleep 1
+            done
+            if kill -0 "${pid}" 2>/dev/null; then
+                log_msg "进程未响应 TERM，强制结束 pid=${pid}"
+                kill -9 "${pid}" 2>/dev/null
+            fi
+        fi
+        rm -f "${PID_FILE}"
+    fi
+
+    # 清理 socket 文件
+    rm -f "${SOCKET_FILE}"
+    log_msg "已停止"
+    echo "substore-ui-go stopped"
+    return 0
+}
+
+status_app() {
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid=$(cat "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            echo "running"
+            return 0
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    echo "stopped"
+    return 1
+}
+
+ACTION="${1:-start}"
+
+case "${ACTION}" in
+    start)
+        start_app || exit 1
+        ;;
+    stop)
+        stop_app
+        ;;
+    restart)
+        stop_app
+        sleep 1
+        start_app || exit 1
+        ;;
+    status)
+        # fnOS 约定：0=运行中，3=未运行，1=执行失败
+        if status_app >/dev/null 2>&1; then
+            exit 0
+        else
+            exit 3
+        fi
+        ;;
+    upgrade)
+        stop_app
+        sleep 1
+        start_app || exit 1
+        ;;
+    *)
+        echo "未知操作: ${ACTION}" > "${TRIM_TEMP_LOGFILE}"
+        echo "用法: $0 {start|stop|restart|status|upgrade}"
+        exit 1
+        ;;
+esac
+
+exit 0

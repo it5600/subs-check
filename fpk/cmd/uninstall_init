@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# 卸载前回调：确保应用已停止，避免文件被占用
+bash "${0%/*}/main" stop 2>/dev/null
+exit 0

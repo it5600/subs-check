@@ -2,6 +2,15 @@
 
 基于 [beck-8/subs-check](https://github.com/beck-8/subs-check) 深度学习成果，将 subs-check 核心与 Sub-Store 管理面板合并为单一 Go 二进制，部署于飞牛 OS (fnOS) 的一体化应用。
 
+## 在飞牛 NAS 上安装
+
+**不需要 clone 源码、不需要 Go 环境**。直接下载已构建的 FPK 安装包并校验后安装，
+完整步骤（下载直链、校验值、三种安装通道、验证清单、升级与回滚）见 **[INSTALL.md](INSTALL.md)**。
+
+- 最新 Release：`fpk-v1.4.9` → `trim.substore-ui-go-1.4.9.fpk`
+- 打包骨架与自行构建指南：[fpk/README.md](fpk/README.md)
+- 应用入口：`/app/trim-substore-ui-go`（fnOS 统一网关，Unix Socket，无需开放端口）
+
 ## 架构概览
 
 ```

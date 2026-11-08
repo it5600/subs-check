@@ -33,6 +33,12 @@ func CacheDir() string {
 // WriteFileAtomic writes via a temp file and rename so readers never see partial
 // content. Missing dirs are created with 0700; the file ends up 0600.
 func WriteFileAtomic(path string, data []byte) error {
+	return WriteFileAtomicMode(path, data, 0o600)
+}
+
+// WriteFileAtomicMode writes via a temp file and rename, applying perm before
+// the rename so readers never see partial content or a half-applied mode.
+func WriteFileAtomicMode(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -47,7 +53,16 @@ func WriteFileAtomic(path string, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
 		os.Remove(tmpName)
 		return err
 	}

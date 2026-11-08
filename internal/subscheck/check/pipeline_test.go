@@ -51,7 +51,7 @@ func TestPipeline_PreservesOrder(t *testing.T) {
 		PrintProgress:   false,
 	}, func() {
 		pc := &ProxyChecker{results: make([]Result, 0)}
-		results, err := pc.run(makePipelineProxies(n))
+		results, err := pc.run(makePipelineProxies(n), nil)
 		if err != nil {
 			t.Fatalf("run returned error: %v", err)
 		}
@@ -97,7 +97,7 @@ func TestPipeline_HonorsSuccessLimit(t *testing.T) {
 		PrintProgress:   false,
 	}, func() {
 		pc := &ProxyChecker{results: make([]Result, 0)}
-		results, err := pc.run(makePipelineProxies(input))
+		results, err := pc.run(makePipelineProxies(input), nil)
 		if err != nil {
 			t.Fatalf("run returned error: %v", err)
 		}
@@ -127,7 +127,7 @@ func TestPipeline_NoSpeedStage(t *testing.T) {
 		PrintProgress:   false,
 	}, func() {
 		pc := &ProxyChecker{results: make([]Result, 0)}
-		results, err := pc.run(makePipelineProxies(n))
+		results, err := pc.run(makePipelineProxies(n), nil)
 		if err != nil {
 			t.Fatalf("run returned error: %v", err)
 		}

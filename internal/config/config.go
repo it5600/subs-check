@@ -37,6 +37,11 @@ type Config struct {
 	CORSAllowedOrigins []string
 
 	SecurityHeaders map[string]string
+
+	// AccessLogPath is the file path for structured JSON access logs.
+	// When empty, access logs go to stdout (default). When set, they are
+	// written as JSON lines to this file for fnOS log center collection.
+	AccessLogPath string
 }
 
 // Load reads configuration from environment variables with sensible defaults
@@ -94,6 +99,8 @@ func Load() *Config {
 		CORSAllowedOrigins: corsOrigins,
 
 		SecurityHeaders: secHeaders,
+
+		AccessLogPath: getEnv("ACCESS_LOG_PATH", ""),
 	}
 }
 

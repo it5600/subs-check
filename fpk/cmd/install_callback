@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# 安装后回调：生成默认配置并把向导端口写入 settings.conf
+#
+# 说明：系统的 settings.conf 会在安装/更新时用向导收集到的变量重写，
+# 因此自定义写入必须放在 install_callback / config_callback 中。
+
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+SETTINGS_FILE="${TRIM_PKGETC}/settings.conf"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null
+}
+
+PORT="${wizard_port:-8300}"
+
+# ---------- 写入 settings.conf ----------
+# 保留已有的其他键，只更新 PORT
+write_settings() {
+    mkdir -p "${TRIM_PKGETC}" || return 1
+
+    if [ -f "${SETTINGS_FILE}" ]; then
+        if grep -q '^PORT=' "${SETTINGS_FILE}"; then
+            sed -i "s/^PORT=.*/PORT=${PORT}/" "${SETTINGS_FILE}"
+        else
+            printf 'PORT=%s\n' "${PORT}" >> "${SETTINGS_FILE}"
+        fi
+    else
+        printf 'PORT=%s\n' "${PORT}" > "${SETTINGS_FILE}"
+    fi
+    log_msg "settings.conf 端口已写入: ${PORT}"
+}
+
+write_settings
+
+# ---------- 生成默认 subs-check 配置 ----------
+# 共享目录由系统按 config/resource 的 data-share 声明创建，
+# 路径形如 /vol1/@appshare/<appname>/<share-name>
+DATA_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+if [ -z "${DATA_DIR}" ] || [ "${DATA_DIR}" = ":" ]; then
+    DATA_DIR="${TRIM_PKGVAR}"
+fi
+
+CONFIG_FILE="${DATA_DIR}/config.yaml"
+
+# 共享目录可能尚未创建（首次安装时序问题），这里兜底创建
+if [ ! -d "${DATA_DIR}" ]; then
+    mkdir -p "${DATA_DIR}" 2>/dev/null || true
+    chown -R substoreui:substoreui "${DATA_DIR}" 2>/dev/null || true
+    log_msg "已创建共享目录: ${DATA_DIR}"
+fi
+
+if [ ! -f "${CONFIG_FILE}" ]; then
+    # 二进制首次启动时会自动生成默认配置模板；这里只预置目录，
+    # 避免在 install 阶段阻塞（模板生成需要解压内嵌资源，耗时较长）。
+    log_msg "配置文件不存在，将由应用首次启动自动生成: ${CONFIG_FILE}"
+fi
+
+log_msg "install_callback 完成"
+exit 0

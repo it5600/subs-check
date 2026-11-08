@@ -343,6 +343,10 @@
                             <div id="successLabel">成功节点: <span id="successText">N/A</span></div>
                             <div><span id="processPercent">N/A</span></div>
                         </div>
+                        <div class="progress-info">
+                            <div>预计剩余: <span id="etaText">N/A</span></div>
+                            <div>已用时: <span id="elapsedText">N/A</span></div>
+                        </div>
                     </div>
                     <div class="progress">
                         <div id="progressBarSuccess" class="progress-bar progress-bar-success" role="progressbar" style="width: 0%"></div>
@@ -409,6 +413,8 @@
             progressBarSuccess: document.getElementById('progressBarSuccess'),
             successLabel: document.getElementById('successLabel'),
             successText: document.getElementById('successText'),
+            etaText: document.getElementById('etaText'),
+            elapsedText: document.getElementById('elapsedText'),
             statusContainer: document.getElementById('statusContainer'),
             statusIcon: document.getElementById('statusIcon'),
             statusText: document.getElementById('nextCheckTime'),
@@ -825,6 +831,8 @@
             dom.progressText.textContent = 'N/A';
             dom.progressPercent.textContent = 'N/A';
             dom.processPercent.textContent = 'N/A';
+            dom.etaText.textContent = 'N/A';
+            dom.elapsedText.textContent = 'N/A';
             dom.progressBarTotal.style.width = '0%';
             dom.progressBarSuccess.style.width = '0%';
             if (dom.successLabel) {
@@ -888,6 +896,25 @@
             dom.statusText.textContent = text;
         }
 
+        // ETA 展示：后端 eta 语义为 -1=计算中, 0=空闲/完成, >0=剩余秒数。
+        // elapsed 在检测进行中为已用时，空闲时为最近一轮总耗时。
+        function updateEta(data, checking) {
+            const eta = Number(data.eta || 0);
+            if (!checking) {
+                dom.etaText.textContent = '已完成';
+            } else if (eta === -1) {
+                dom.etaText.textContent = '计算中...';
+            } else if (eta > 0) {
+                const m = Math.floor(eta / 60), s = eta % 60;
+                dom.etaText.textContent = m > 0 ? (m + ' 分 ' + s + ' 秒') : (s + ' 秒');
+            } else {
+                dom.etaText.textContent = '即将完成';
+            }
+            const secs = Math.max(0, Number(data.elapsed || 0));
+            const m = Math.floor(secs / 60), s = secs % 60;
+            dom.elapsedText.textContent = m > 0 ? (m + ' 分 ' + s + ' 秒') : (s + ' 秒');
+        }
+
         function updateStatus() {
             fetch('/api/status', {
                 headers: addApiKeyHeader()
@@ -900,6 +927,7 @@
                 if (data) {
                     if (data.checking) {
                         setStatus('running', 'bi-arrow-repeat rotate-animation', '正在检测中...');
+                        updateEta(data, true);
 
                         if (data.pipeline) {
                             updatePipelineBar(data.pipeline, !!data.hasSpeedTest);
@@ -914,6 +942,7 @@
 
                         updatePhaseSteps(0, 0, 0, data.phaseResults);
                         resetProgress();
+                        updateEta(data, false); // 保留最近一轮耗时展示
                         updateResultsLink(true);
                     }
                 }

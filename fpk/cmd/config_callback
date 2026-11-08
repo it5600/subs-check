@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# 配置变更回调：保存新端口并重启应用
+#
+# 端口优先级链（cmd/main 中读取）：
+#   settings.conf 的 PORT  >  TRIM_SERVICE_PORT  >  8300
+# 这里把向导收集到的 wizard_port 落到 settings.conf，随后重启。
+
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+SETTINGS_FILE="${TRIM_PKGETC}/settings.conf"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null
+}
+
+PORT="${wizard_port:-8300}"
+
+mkdir -p "${TRIM_PKGETC}"
+
+if [ -f "${SETTINGS_FILE}" ]; then
+    if grep -q '^PORT=' "${SETTINGS_FILE}"; then
+        sed -i "s/^PORT=.*/PORT=${PORT}/" "${SETTINGS_FILE}"
+    else
+        printf 'PORT=%s\n' "${PORT}" >> "${SETTINGS_FILE}"
+    fi
+else
+    printf 'PORT=%s\n' "${PORT}" > "${SETTINGS_FILE}"
+fi
+
+log_msg "配置已更新，端口=${PORT}，正在重启应用"
+
+# 重启：先停再起，确保新端口生效
+bash "${0%/*}/main" stop
+sleep 2
+bash "${0%/*}/main" start
+
+exit 0

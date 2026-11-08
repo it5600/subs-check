@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/json"
@@ -13,25 +14,28 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gin-contrib/pprof"
+	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
+	"substore-ui-go/internal/assets"
 	"substore-ui-go/internal/config"
 	"substore-ui-go/internal/handler"
 	"substore-ui-go/internal/middleware"
 	"substore-ui-go/internal/model"
 	"substore-ui-go/internal/service"
-	scconfig "substore-ui-go/internal/subscheck/config"
 	"substore-ui-go/internal/subscheck/check"
+	scconfig "substore-ui-go/internal/subscheck/config"
 	"substore-ui-go/internal/subscheck/export"
+	"substore-ui-go/internal/subscheck/fluxor"
 	"substore-ui-go/internal/subscheck/save"
 	"substore-ui-go/internal/subscheck/save/method"
-	"github.com/gin-contrib/pprof"
-	"github.com/gin-gonic/gin"
-	"gopkg.in/yaml.v3"
 )
 
 // SubStoreApp holds the merged application state
@@ -149,6 +153,14 @@ func (a *SubStoreApp) SetupRoutes(router *gin.Engine) error {
 		api.GET("/export", a.getExportStatus)
 		api.POST("/export/:target", a.generateExport)
 		api.DELETE("/export/:target", a.disableExport)
+
+		// ===== Fluxor observability & control =====
+		api.GET("/fluxor/status", a.handleFluxorStatus)
+		api.GET("/fluxor/connections", a.handleFluxorConnections)
+		api.GET("/fluxor/providers", a.handleFluxorProviders)
+		api.GET("/fluxor/memory", a.handleFluxorMemory)
+		api.POST("/fluxor/reload/:name", a.handleFluxorReload)
+		api.POST("/fluxor/delay", a.handleFluxorDelay)
 	}
 
 	// ===== substore-ui-go API routes (with session/API-key auth) =====
@@ -208,19 +220,19 @@ var mimeTypes = map[string]string{
 	".map":   "application/json; charset=utf-8",
 }
 
-// serveFrontend serves the single-page frontend from PublicDir.
+// serveFrontend serves the single-page frontend.
 //
-// It mirrors the behaviour of router.Static("/", dir) — "/" resolves to
-// index.html — while keeping path-traversal protection, ETag support and
-// streaming via http.ServeContent (zero-copy for large bundles).
+// Assets are served from the binary-embedded FS first (self-contained, immune
+// to fnOS upgrades wiping the www directory); an on-disk PublicDir is honoured
+// as a fallback for local development. It mirrors router.Static("/", dir) —
+// "/" resolves to index.html — while keeping path-traversal protection, ETag
+// support and streaming via http.ServeContent.
 func (a *SubStoreApp) serveFrontend(c *gin.Context) {
 	// Only GET/HEAD are meaningful for static assets.
 	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
-
-	publicDir := filepath.Clean(a.cfg.PublicDir)
 
 	// Strip the gateway prefix so the same binary works behind the fnOS
 	// unified gateway (which forwards the prefixed path) and standalone.
@@ -234,47 +246,44 @@ func (a *SubStoreApp) serveFrontend(c *gin.Context) {
 	}
 
 	relPath := strings.TrimPrefix(requestPath, "/")
-	target := filepath.Join(publicDir, relPath)
-
 	// The root path must serve index.html rather than the directory itself.
 	if relPath == "" {
-		target = filepath.Join(publicDir, "index.html")
+		relPath = "index.html"
 	}
 
-	// Path traversal protection: the resolved path must stay inside publicDir.
-	cleanPublic := filepath.Clean(publicDir)
-	cleanTarget := filepath.Clean(target)
-	rel, err := filepath.Rel(cleanPublic, cleanTarget)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+	// Path traversal protection: reject any ".." segment before touching
+	// either the embedded FS or the disk fallback.
+	if containsDotDot(relPath) {
 		c.AbortWithStatus(http.StatusForbidden)
 		return
 	}
 
-	f, err := os.Open(cleanTarget)
+	// Prefer the embedded FS (self-contained); fall back to disk.
+	f, info, err := a.openFrontendFile(relPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Unknown path: fall back to index.html so client-side routing
-			// (hash-based views) keeps working on a hard refresh.
-			f, err = os.Open(filepath.Join(cleanPublic, "index.html"))
-			if err != nil {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-			cleanTarget = filepath.Join(cleanPublic, "index.html")
-		} else {
-			c.AbortWithStatus(http.StatusInternalServerError)
+		// Unknown path: fall back to index.html so client-side routing
+		// (hash-based views) keeps working on a hard refresh.
+		f, info, err = a.openFrontendFile("index.html")
+		if err != nil {
+			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
+		relPath = "index.html"
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		// Only close files opened from disk (os.File implements io.Closer);
+		// embedded bytes.Readers need no closing.
+		if closer, ok := f.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}()
 
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
+	if info.IsDir() {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(cleanTarget))
+	ext := strings.ToLower(path.Ext(relPath))
 	mime, ok := mimeTypes[ext]
 	if !ok {
 		mime = "application/octet-stream"
@@ -284,11 +293,7 @@ func (a *SubStoreApp) serveFrontend(c *gin.Context) {
 	etag := fmt.Sprintf(`"%x-%x"`, info.Size(), info.ModTime().UnixNano())
 	w := c.Writer
 	w.Header().Set("Content-Type", mime)
-	if ext == ".html" {
-		w.Header().Set("Cache-Control", "no-cache")
-	} else {
-		w.Header().Set("Cache-Control", "public, max-age=3600")
-	}
+	w.Header().Set("Cache-Control", cacheControlFor(ext))
 	w.Header().Set("ETag", etag)
 
 	if match := c.Request.Header.Get("If-None-Match"); match == etag {
@@ -299,16 +304,102 @@ func (a *SubStoreApp) serveFrontend(c *gin.Context) {
 	http.ServeContent(w, c.Request, info.Name(), info.ModTime(), f)
 }
 
+// openFrontendFile opens relPath from the embedded FS, falling back to the
+// on-disk PublicDir when the embedded FS does not contain the file. The disk
+// fallback is only used during local development; in a packaged FPK the
+// embedded FS always wins.
+//
+// Returns an io.ReadSeeker (http.ServeContent requirement) plus its stat.
+// Embedded files are read into memory (small: ~64KB total); disk files are
+// opened lazily. The caller should close the result when it implements
+// io.Closer.
+func (a *SubStoreApp) openFrontendFile(relPath string) (io.ReadSeeker, fs.FileInfo, error) {
+	// Embedded FS (preferred).
+	data, err := fs.ReadFile(assets.Frontend(), relPath)
+	if err == nil {
+		info, err := fs.Stat(assets.Frontend(), relPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		return bytes.NewReader(data), info, nil
+	}
+
+	// Disk fallback (dev only).
+	publicDir := filepath.Clean(a.cfg.PublicDir)
+	target := filepath.Join(publicDir, filepath.FromSlash(relPath))
+	cleanPublic := filepath.Clean(publicDir)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanPublic, cleanTarget)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return nil, nil, fs.ErrNotExist
+	}
+	f, err := os.Open(cleanTarget)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	return f, info, nil
+}
+
+// cacheControlFor returns a分级缓存策略 by file extension, following the
+// go-download community pattern: HTML never cached (so deploys take effect
+// immediately), JS/CSS short-lived, fonts long-lived, images medium.
+func cacheControlFor(ext string) string {
+	switch ext {
+	case ".html":
+		return "no-cache" // revalidate each load
+	case ".js", ".css":
+		return "public, max-age=86400" // 1 day
+	case ".woff2", ".woff", ".ttf":
+		return "public, max-age=2592000" // 30 days
+	case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico":
+		return "public, max-age=604800" // 7 days
+	default:
+		return "public, max-age=3600"
+	}
+}
+
+// containsDotDot reports whether any path segment equals "..". Used to block
+// traversal before the embedded FS or disk is touched.
+func containsDotDot(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 // ===== Auth Middleware =====
 
+// authMiddleware 校验 subs-check 系列端点的凭据。
+//
+// 两套管理界面使用不同的凭据，但调用的是同一批 /api 端点：
+//   - subs-check 原生 admin.html：X-API-Key header（含所有写操作）
+//   - 合并后的 www/app.js：Cookie Session（登录后由服务端下发）
+//
+// 为不扩大 CSRF 攻击面，Cookie Session 只对只读方法（GET/HEAD）放行；
+// 写操作（POST/PATCH/DELETE）仍必须携带 X-API-Key。匿名访问一律拒绝。
 func (a *SubStoreApp) authMiddleware(key string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		apiKey := c.GetHeader("X-API-Key")
-		if subtle.ConstantTimeCompare([]byte(apiKey), []byte(key)) != 1 {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的API密钥"})
+		if subtle.ConstantTimeCompare([]byte(apiKey), []byte(key)) == 1 {
+			c.Next()
 			return
 		}
-		c.Next()
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			if a.handlerApp != nil && a.handlerApp.Sessions != nil {
+				if sid, err := c.Cookie("substore_sid"); err == nil && sid != "" && a.handlerApp.Sessions.Get(sid) {
+					c.Next()
+					return
+				}
+			}
+		}
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的API密钥"})
 	}
 }
 
@@ -397,13 +488,14 @@ func (a *SubStoreApp) getStatus(c *gin.Context) {
 		phaseResults[fmt.Sprintf("%d", i)] = check.GetPhaseResult(i)
 	}
 	pipeline := gin.H{
-		"total":      check.ProxyCount.Load(),
-		"aliveDone":  check.Progress.Load(),
-		"alivePass":  check.Available.Load(),
-		"mediaDone":  check.MediaDone.Load(),
-		"filterPass": check.FilterPassed.Load(),
-		"speedDone":  check.SpeedDone.Load(),
-		"speedPass":  check.SpeedOk.Load(),
+		"total":           check.ProxyCount.Load(),
+		"aliveDone":       check.Progress.Load(),
+		"alivePass":       check.Available.Load(),
+		"mediaDone":       check.MediaDone.Load(),
+		"filterPass":      check.FilterPassed.Load(),
+		"speedDone":       check.SpeedDone.Load(),
+		"speedPass":       check.SpeedOk.Load(),
+		"collectorPassed": check.CollectorPassed.Load(),
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"checking":     a.scApp.checking.Load(),
@@ -414,6 +506,15 @@ func (a *SubStoreApp) getStatus(c *gin.Context) {
 		"phaseResults": phaseResults,
 		"pipeline":     pipeline,
 		"hasSpeedTest": scconfig.GlobalConfig.SpeedTestUrl != "",
+		"eta":          check.ETASeconds.Load(),              // -1=计算中, 0=空闲/完成, >0=剩余秒数
+		"duration":     int64(check.CheckDuration.Seconds()), // 最近一轮检测耗时（秒）
+		"elapsed": func() int64 {
+			// 检测进行中：返回自本轮开始的已用时长；否则回退为上一轮耗时
+			if a.scApp.checking.Load() && !check.CheckStartTime.IsZero() {
+				return int64(time.Since(check.CheckStartTime).Seconds())
+			}
+			return int64(check.CheckDuration.Seconds())
+		}(),
 	})
 }
 
@@ -535,6 +636,137 @@ func (a *SubStoreApp) exportHandler(c *gin.Context) {
 	http.ServeContent(c.Writer, c.Request, "", served.ModTime, served.File)
 }
 
+// ===== Fluxor observability & control handlers =====
+
+func (a *SubStoreApp) handleFluxorStatus(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	h, err := fluxor.GetHealth(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("获取 Fluxor 状态失败: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"enabled":     fluxor.Enabled(),
+		"version":     h.Version,
+		"uptime":      h.Uptime,
+		"providers":   h.Providers,
+		"nodes":       h.Nodes,
+		"memoryBytes": h.Memory,
+	})
+}
+
+func (a *SubStoreApp) handleFluxorConnections(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	conns, err := fluxor.GetConnections(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("获取 Fluxor 连接失败: %v", err)})
+		return
+	}
+	// Aggregate by network and rule for a compact summary.
+	byNetwork := map[string]int{}
+	byRule := map[string]int{}
+	for _, conn := range conns {
+		byNetwork[conn.Metadata.Network]++
+		if conn.Metadata.Rule != "" {
+			byRule[conn.Metadata.Rule]++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"enabled":     fluxor.Enabled(),
+		"total":       len(conns),
+		"byNetwork":   byNetwork,
+		"byRule":      byRule,
+		"connections": conns,
+	})
+}
+
+func (a *SubStoreApp) handleFluxorProviders(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	providers, err := fluxor.GetProviders(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("获取 Fluxor providers 失败: %v", err)})
+		return
+	}
+	total := 0
+	for _, p := range providers {
+		total += p.Now
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"enabled":   fluxor.Enabled(),
+		"total":     total,
+		"providers": providers,
+	})
+}
+
+func (a *SubStoreApp) handleFluxorReload(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider 名称不能为空"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	if err := fluxor.ReloadProvider(ctx, name); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("热重载失败: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("provider %s 已热重载", name)})
+}
+
+func (a *SubStoreApp) handleFluxorMemory(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	mem, err := fluxor.GetMemory(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("获取 Fluxor 内存信息失败: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"enabled":     fluxor.Enabled(),
+		"memoryBytes": mem,
+		"memoryMB":    mem / (1024 * 1024),
+	})
+}
+
+func (a *SubStoreApp) handleFluxorDelay(c *gin.Context) {
+	var req struct {
+		Proxy     string `json:"proxy"`
+		URL       string `json:"url"`
+		TimeoutMs int    `json:"timeout"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求格式"})
+		return
+	}
+	if req.Proxy == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "proxy 不能为空"})
+		return
+	}
+	if req.URL == "" {
+		req.URL = scconfig.GlobalConfig.FluxorDelayUrl
+	}
+	if req.URL == "" {
+		req.URL = scconfig.GlobalConfig.AliveTestUrl
+	}
+	if req.TimeoutMs <= 0 {
+		req.TimeoutMs = scconfig.GlobalConfig.FluxorDelayTimeout
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	delay, err := fluxor.DelayTest(ctx, req.Proxy, req.URL, req.TimeoutMs)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("延迟测试失败: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"proxy": req.Proxy, "delay": delay, "url": req.URL})
+}
+
 // ===== substore-ui-go API Handlers (adapted to Gin) =====
 
 // buildHealthData constructs the shared health response payload used by
@@ -631,6 +863,26 @@ func (a *SubStoreApp) handleDashboard(c *gin.Context) {
 
 	resCh := make(chan dashboardResults, 1)
 
+	// Fluxor 状态单独并发拉取：它是外部进程，不可达时不能拖慢整个仪表盘。
+	// 硬上限 2s（请求内 context）+ 3s（聚合等待），超时返回降级信息。
+	fluxorCh := make(chan gin.H, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		h, err := fluxor.GetHealth(ctx)
+		if err != nil || h == nil {
+			fluxorCh <- gin.H{"enabled": fluxor.Enabled(), "error": "查询失败"}
+			return
+		}
+		fluxorCh <- gin.H{
+			"enabled":   fluxor.Enabled(),
+			"version":   h.Version,
+			"uptime":    h.Uptime,
+			"providers": h.Providers,
+			"nodes":     h.Nodes,
+		}
+	}()
+
 	go func() {
 		var nodeSummary model.NodeSummary
 		if resultsData, err := os.ReadFile(save.ResultsPath()); err == nil {
@@ -669,11 +921,20 @@ func (a *SubStoreApp) handleDashboard(c *gin.Context) {
 
 	res := <-resCh
 
+	fluxorData := gin.H{"enabled": fluxor.Enabled()}
+	select {
+	case f := <-fluxorCh:
+		fluxorData = f
+	case <-time.After(3 * time.Second):
+		fluxorData = gin.H{"enabled": fluxor.Enabled(), "error": "查询超时"}
+	}
+
 	dashboard := gin.H{
 		"health":  healthData,
 		"nodes":   res.nodeSummary,
 		"sources": res.sourceSummary,
 		"status":  res.pipeline,
+		"fluxor":  fluxorData,
 	}
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "ok", "data": dashboard})
@@ -681,6 +942,13 @@ func (a *SubStoreApp) handleDashboard(c *gin.Context) {
 
 func (a *SubStoreApp) handleNodes(c *gin.Context) {
 	nodes, err := service.FetchNodesWithSingleflight(func() ([]model.Node, error) {
+		// Merged binary: the results file is local, so read it directly and
+		// only fall back to the loopback HTTP proxy when it is unreadable. This
+		// removes a self-referential network hop (and the 502 that a stale
+		// SUBS_CHECK_PORT produced) from the node page.
+		if local, ok := a.loadNodesLocal(); ok {
+			return local, nil
+		}
 		statusCode, body, err := service.ProxyGet(c.Request.Context(), a.cfg.SubsCheckHost, a.cfg.SubsCheckPort, "/sub/all.yaml", a.cfg.APIKey)
 		if err != nil {
 			return nil, err

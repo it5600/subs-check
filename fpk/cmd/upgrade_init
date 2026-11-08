@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# 升级前回调：停止旧版本进程，保留数据
+bash "${0%/*}/main" stop 2>/dev/null
+exit 0

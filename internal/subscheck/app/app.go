@@ -13,6 +13,7 @@ import (
 	"substore-ui-go/internal/subscheck/assets"
 	"substore-ui-go/internal/subscheck/check"
 	"substore-ui-go/internal/subscheck/config"
+	"substore-ui-go/internal/subscheck/fluxor"
 	"substore-ui-go/internal/subscheck/monitor"
 	"substore-ui-go/internal/subscheck/save"
 	"substore-ui-go/internal/subscheck/utils"
@@ -226,6 +227,10 @@ func (app *App) checkProxies() error {
 	save.SaveConfig(results)
 	utils.SendNotify(len(results))
 	utils.UpdateSubs()
+	// Fluxor 协同：每轮检测完成后自动热重载 provider，零断流更新节点列表
+	// 必须在 UpdateSubs() 之后调用——UpdateSubs 触发 sub-store 生成新订阅，
+	// 在此之前 reload 会拿到旧/空内容导致 YAML 解析失败
+	fluxor.AutoReloadFluxor()
 	utils.ExecuteCallback(len(results))
 
 	return nil

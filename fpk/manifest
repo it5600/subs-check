@@ -1,0 +1,16 @@
+appname               = trim.substore-ui-go
+version               = 1.4.9
+display_name          = Sub-Store 管理面板
+desc                  = 订阅节点管理面板，集成 subs-check 节点测活与 Sub-Store 订阅转换服务，单二进制一体化部署。通过飞牛统一网关接入，无需开放安全入口。
+platform              = x86
+source                = thirdparty
+maintainer            = it5600
+maintainer_url        = https://github.com/it5600/subs-check
+distributor           = it5600
+distributor_url       = https://github.com/it5600/subs-check
+os_min_version        = 1.1.3100
+desktop_uidir         = ui
+desktop_applaunchname = trim.substore-ui-go.main
+ctl_stop              = true
+checkport             = false
+changelog             = 1.4.9 借鉴社区优秀实现：新增检测 ETA 预估（滑动窗口实时速率+历史速率融合，/api/status 与 admin 页展示）、流媒体检测瞬时网络故障重试（指数退避+抖动）；修复合并管理面板因 Cookie Session 与 X-API-Key 鉴权不一致导致仪表盘/日志/设置页 401 的问题，并兼容旧端点裸 JSON 响应；Dashboard 新增 Fluxor 状态卡片（并行拉取+超时降级）；新增 fluxor-delay-api / fluxor-delay-timeout 配置项
