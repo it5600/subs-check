@@ -122,7 +122,7 @@ func marshalProxies(results []check.Result) ([]byte, error) {
 
 // fetchSubStoreData 从 SubStore API 获取数据
 func fetchSubStoreData(url, name string) []byte {
-	resp, err := http.Get(url)
+	resp, err := utils.OutboundHTTPClient.Get(url)
 	if err != nil {
 		slog.Error(fmt.Sprintf("获取%s请求失败: %v", name, err))
 		return nil

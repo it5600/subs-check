@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"time"
@@ -287,7 +288,10 @@ func DelayTest(ctx context.Context, proxy, url string, timeoutMs int) (int, erro
 	if timeoutMs <= 0 {
 		timeoutMs = 5000
 	}
-	path := fmt.Sprintf("/proxies/%s/delay?timeout=%d&url=%s", proxy, timeoutMs, url)
+	// proxy / url 直接来自 /api/fluxor/delay 的请求体。未转义时 "?"/"&"/"#"
+	// 可注入额外查询参数，"/" 甚至能把路径指向 controller 的其它端点。
+	path := fmt.Sprintf("/proxies/%s/delay?timeout=%d&url=%s",
+		neturl.PathEscape(proxy), timeoutMs, neturl.QueryEscape(url))
 	data, err := c.do(ctx, "GET", path, nil)
 	if err != nil {
 		return 0, err

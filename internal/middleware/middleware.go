@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -224,50 +225,63 @@ func SecurityHeadersHandler(headers map[string]string, next http.Handler) http.H
 // When logPath is non-empty, logs are written as structured JSON lines to that file
 // (creating parent dirs if needed); otherwise to stdout as plain text.
 func LogRequest(next http.Handler, logPath string) http.Handler {
-	// Lazily open the log file only when a path is provided.
+	// 旧实现在锁外读 logPath、锁内写 logPath（打开失败时置空回退），
+	// 多请求并发时构成 data race；同时 Marshal/Write/MkdirAll 的错误被
+	// 全部忽略，磁盘满或权限错时访问日志会静默丢失。
+	// 改为不可变 wantFile + atomic.Bool 降级开关，文件只在锁内访问。
 	var (
-		fileMu sync.Mutex
-		file   *os.File
-		err    error
+		fileMu   sync.Mutex
+		file     *os.File
+		disabled atomic.Bool
 	)
+	wantFile := logPath != ""
 
 	openFile := func() {
-		if logPath == "" {
+		if !wantFile || disabled.Load() {
 			return
 		}
 		fileMu.Lock()
 		defer fileMu.Unlock()
-		if file != nil {
+		if file != nil || disabled.Load() {
 			return
 		}
-		dir := filepath.Dir(logPath)
-		if dir != "" {
-			os.MkdirAll(dir, 0o755)
+		if dir := filepath.Dir(logPath); dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				log.Printf("[WARN] 无法创建访问日志目录 %s: %v（回退到 stdout）", dir, err)
+				disabled.Store(true)
+				return
+			}
 		}
-		file, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			log.Printf("[WARN] 无法打开访问日志文件 %s: %v（回退到 stdout）", logPath, err)
-			logPath = ""
+			disabled.Store(true)
+			return
 		}
+		file = f
 	}
 
 	writeJSON := func(entry map[string]any) {
 		openFile()
-		if logPath == "" {
-			// Fallback: stdout plain text
+		fileMu.Lock()
+		f := file
+		if f != nil {
+			data, err := json.Marshal(entry)
+			if err == nil {
+				_, err = f.Write(append(data, '\n'))
+			}
+			if err != nil {
+				log.Printf("[WARN] 写入访问日志失败: %v", err)
+			}
+		}
+		fileMu.Unlock()
+
+		if f == nil {
+			// Fallback: stdout plain text（日志格式保持不变）
 			log.Printf("[%s] %s %s -> %d (%dms) [%s]",
 				entry["time"], entry["method"], entry["path"],
 				entry["status"], entry["duration_ms"], entry["remote"])
-			return
 		}
-		fileMu.Lock()
-		defer fileMu.Unlock()
-		if file == nil {
-			return
-		}
-		data, _ := json.Marshal(entry)
-		file.Write(data)
-		file.Write([]byte("\n"))
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

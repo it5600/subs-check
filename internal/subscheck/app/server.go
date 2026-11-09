@@ -60,7 +60,17 @@ func NewMergedApp(cfg *config.Config, scVersion string) *SubStoreApp {
 
 // Initialize initializes the subs-check core
 func (a *SubStoreApp) Initialize() error {
-	return a.scApp.Initialize()
+	if err := a.scApp.Initialize(); err != nil {
+		return err
+	}
+	// 统一两套配置路径：getConfig/updateConfig 读写 a.scApp.configPath，
+	// handleSources / Add / Update / DeleteSource / handleDashboard 读写
+	// a.cfg.ConfigPath。未显式设置 SUBS_CONFIG_PATH 时两者默认值不同
+	// （前者 <exe>/config/config.yaml，后者 /vol1/1000/Docker/...），
+	// 「设置」页保存的配置与「订阅源」页操作的不是同一个文件。
+	// scApp.Initialize() 已完成 -f / 环境变量 / 默认目录的解析，以它为唯一来源。
+	a.cfg.ConfigPath = a.scApp.configPath
+	return nil
 }
 
 // Run starts the merged application
@@ -101,7 +111,7 @@ func (a *SubStoreApp) SetupRoutes(router *gin.Engine) error {
 	// via PPROF_ENABLED=true, and only on a non-gateway listener. Behind the
 	// fnOS gateway the socket is reachable by any process on the host, so
 	// exposing pprof there would leak credentials and internal state.
-	if enablePprof() {
+	if enablePprof(a.cfg) {
 		pprof.Register(router)
 		slog.Info("pprof 已启用（调试端口）", "路由", "/debug/pprof")
 	} else {
@@ -118,7 +128,10 @@ func (a *SubStoreApp) SetupRoutes(router *gin.Engine) error {
 				slog.Warn("未设置api-key，已生成一个随机api-key", "api-key", scconfig.GlobalConfig.APIKey)
 			}
 		}
-		slog.Info("启用Web控制面板", "path", "http://ip:port/admin", "api-key", scconfig.GlobalConfig.APIKey)
+		// 不要把 API Key 写进日志：FileLogger 落在 os.TempDir()/subs-check.log，
+		// 日志采集/其它本地用户可直接读取，等于泄露管理员凭据。
+		// 首次随机生成时上面那条 Warn 已经给出明文，这里只记录是否已配置。
+		slog.Info("启用Web控制面板", "path", "http://ip:port/admin", "api-key", "***REDACTED***")
 
 		router.SetHTMLTemplate(template.Must(template.New("").ParseFS(configFS, "templates/*.html")))
 
@@ -452,7 +465,13 @@ func (a *SubStoreApp) sessionAuthMiddleware() gin.HandlerFunc {
 // enablePprof reports whether profiling endpoints should be registered.
 // Disabled by default so the process does not expose heap dumps and goroutine
 // stacks to whoever can reach the listener.
-func enablePprof() bool {
+// enablePprof 与上面的注释保持一致：仅在「显式开启」且「非网关 socket
+// 监听」时注册。Unix socket 对主机上任意进程可连，把 heap/goroutine dump
+// 暴露在那里等于泄露内存中的配置与凭据。
+func enablePprof(cfg *config.Config) bool {
+	if cfg != nil && cfg.SocketPath != "" {
+		return false
+	}
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("PPROF_ENABLED")))
 	return v == "1" || v == "true" || v == "yes"
 }
@@ -469,10 +488,17 @@ func (a *SubStoreApp) getConfig(c *gin.Context) {
 }
 
 func (a *SubStoreApp) updateConfig(c *gin.Context) {
+	// 与 handleLogin / handleAddSource 一致：限制请求体大小，避免超大 YAML
+	// 直接进入 yaml.Unmarshal 造成内存与 CPU 尖峰。响应文案保持不变。
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, a.cfg.MaxBodySize))
+	if err != nil {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "请求体过大"})
+		return
+	}
 	var req struct {
 		Content string `json:"content"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求格式"})
 		return
 	}
@@ -513,13 +539,13 @@ func (a *SubStoreApp) getStatus(c *gin.Context) {
 		"pipeline":     pipeline,
 		"hasSpeedTest": scconfig.GlobalConfig.SpeedTestUrl != "",
 		"eta":          check.ETASeconds.Load(),              // -1=计算中, 0=空闲/完成, >0=剩余秒数
-		"duration":     int64(check.CheckDuration.Seconds()), // 最近一轮检测耗时（秒）
+		"duration":     int64(check.CheckDuration().Seconds()), // 最近一轮检测耗时（秒）
 		"elapsed": func() int64 {
 			// 检测进行中：返回自本轮开始的已用时长；否则回退为上一轮耗时
-			if a.scApp.checking.Load() && !check.CheckStartTime.IsZero() {
-				return int64(time.Since(check.CheckStartTime).Seconds())
+			if a.scApp.checking.Load() && check.CheckStartNano() > 0 {
+				return int64(check.CheckElapsed().Seconds())
 			}
-			return int64(check.CheckDuration.Seconds())
+			return int64(check.CheckDuration().Seconds())
 		}(),
 	})
 }
@@ -1010,15 +1036,7 @@ func (a *SubStoreApp) handleNodes(c *gin.Context) {
 	}
 
 	total := len(nodes)
-	totalPages := (total + pageSize - 1) / pageSize
-	offset := (page - 1) * pageSize
-	end := offset + pageSize
-	if end > total {
-		end = total
-	}
-	if offset >= total {
-		offset = total
-	}
+	page, totalPages, offset, end := clampPageRange(page, pageSize, total)
 	pagedNodes := nodes[offset:end]
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1036,6 +1054,12 @@ func (a *SubStoreApp) handleNodes(c *gin.Context) {
 }
 
 func (a *SubStoreApp) handleSources(c *gin.Context) {
+	// 订阅源的「读-改-写」必须在同一把锁内完成；两个并发添加/删除会
+	// 基于同一份旧内容各自覆写，导致其中一次变更静默丢失。只读列表也
+	// 纳入同一把锁，保证写后立即刷新能看到一致视图。
+	service.ConfigFileMu.Lock()
+	defer service.ConfigFileMu.Unlock()
+
 	cfg, err := service.ReadConfigFile(a.cfg.ConfigPath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500001, "message": "无法读取配置文件"})
@@ -1064,6 +1088,12 @@ func (a *SubStoreApp) handleAddSource(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400002, "message": "URL 无效，需以 http:// 或 https:// 开头"})
 		return
 	}
+
+	// 订阅源的「读-改-写」必须在同一把锁内完成；两个并发添加/删除会
+	// 基于同一份旧内容各自覆写，导致其中一次变更静默丢失。只读列表也
+	// 纳入同一把锁，保证写后立即刷新能看到一致视图。
+	service.ConfigFileMu.Lock()
+	defer service.ConfigFileMu.Unlock()
 
 	cfg, err := service.ReadConfigFile(a.cfg.ConfigPath)
 	if err != nil {
@@ -1121,6 +1151,12 @@ func (a *SubStoreApp) handleUpdateSource(c *gin.Context) {
 		return
 	}
 
+	// 订阅源的「读-改-写」必须在同一把锁内完成；两个并发添加/删除会
+	// 基于同一份旧内容各自覆写，导致其中一次变更静默丢失。只读列表也
+	// 纳入同一把锁，保证写后立即刷新能看到一致视图。
+	service.ConfigFileMu.Lock()
+	defer service.ConfigFileMu.Unlock()
+
 	cfg, err := service.ReadConfigFile(a.cfg.ConfigPath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500004, "message": "无法读取配置文件"})
@@ -1150,6 +1186,12 @@ func (a *SubStoreApp) handleDeleteSource(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400005, "message": "订阅源序号无效"})
 		return
 	}
+
+	// 订阅源的「读-改-写」必须在同一把锁内完成；两个并发添加/删除会
+	// 基于同一份旧内容各自覆写，导致其中一次变更静默丢失。只读列表也
+	// 纳入同一把锁，保证写后立即刷新能看到一致视图。
+	service.ConfigFileMu.Lock()
+	defer service.ConfigFileMu.Unlock()
 
 	cfg, err := service.ReadConfigFile(a.cfg.ConfigPath)
 	if err != nil {
@@ -1282,6 +1324,39 @@ func parseIntDefault(s string, def int) int {
 		return n
 	}
 	return def
+}
+
+// clampPageRange 把来自 query 的分页参数收敛到合法区间。
+//
+// page 由 parseIntDefault 解析且不设上限：?page=9223372036854775807 会让
+// (page-1)*pageSize 在 int 上溢出为负，nodes[负:负] 直接 panic（只被
+// gin.Recovery 兜成 500）。抽成纯函数便于用边界值做表驱动回归。
+func clampPageRange(page, pageSize, total int) (clampedPage, totalPages, offset, end int) {
+	if pageSize < 1 {
+		pageSize = 100
+	}
+	if page < 1 {
+		page = 1
+	}
+	totalPages = (total + pageSize - 1) / pageSize
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	offset = (page - 1) * pageSize
+	end = offset + pageSize
+	if end > total {
+		end = total
+	}
+	if offset < 0 || offset > total {
+		offset = total
+	}
+	if end < offset {
+		end = offset
+	}
+	return page, totalPages, offset, end
 }
 
 func isHTTPS(r *http.Request) bool {

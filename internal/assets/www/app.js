@@ -169,11 +169,18 @@
     },
 
     /**
-     * 统一请求方法
+     * 统一请求方法（1.4.11）
+     *
+     * 兼容约束：不改任何成功响应的字段与结构，裸 JSON 端点继续原样返回。
+     *  - 401 在读取响应体之前判定：非 JSON 的 401 也必须弹登录框；
+     *  - 非 JSON 响应（Sub-Store 透传 YAML、204 空体、NoRoute 的 HTML）不再让
+     *    res.json() 抛 SyntaxError，2xx 原样返回文本；
+     *  - 30s 超时，网络/超时错误统一为中文提示；
+     *  - 所有非 GET/HEAD 写操作（含 PATCH）都带 CSRF Token，后端对 PATCH 同样校验。
      */
     async request(path, method = 'GET', body = null, retry = true) {
       const headers = { 'Content-Type': 'application/json' };
-      if (method === 'POST' || method === 'DELETE') {
+      if (method !== 'GET' && method !== 'HEAD') {
         if (!state.csrfToken) await this.getCsrfToken();
         headers['X-CSRF-Token'] = state.csrfToken;
       }
@@ -181,13 +188,45 @@
       const opts = { method, headers, credentials: 'same-origin' };
       if (body) opts.body = JSON.stringify(body);
 
-      const res = await fetch(apiUrl(path), opts);
-      const json = await res.json();
+      const ctrl = new AbortController();
+      opts.signal = ctrl.signal;
+      const timer = setTimeout(() => ctrl.abort(), 30000);
 
-      // 后端 authMiddleware 的 401 响应体是 {"error":"无效的API密钥"}，不带 code 字段。
-      // 必须在下面的「裸 JSON 兼容」之前拦截：否则错误会被当成成功数据 return，
-      // loadDashboard() 拿错误对象渲染成空面板，且不会抛错 → 登录框永远不出现。
-      if (res.status === 401 || json.code === 401001) {
+      let res, text;
+      try {
+        res = await fetch(apiUrl(path), opts);
+        text = await res.text();
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          throw new Error('请求超时，请检查服务状态或稍后重试');
+        }
+        throw new Error('网络错误: ' + (e.message || '无法连接服务'));
+      } finally {
+        clearTimeout(timer);
+      }
+
+      // 401 必须早于任何 JSON 解析与「裸 JSON 兼容」逻辑：
+      // 1.4.9 的面板空白正是 401 错误体被当成成功数据返回导致的。
+      // 用 res.text()（对任意 body 都安全）而非 res.json()，因此 HTML/空体的
+      // 401 也能走到这里。
+      if (res.status === 401) {
+        state.loggedIn = false;
+        state.csrfToken = null;
+        showLoginScreen();
+        throw new Error('未授权，请重新登录');
+      }
+
+      let json = {};
+      let parsed = false;
+      if (text) {
+        try {
+          json = JSON.parse(text);
+          parsed = true;
+        } catch { /* 非 JSON 响应：下面按状态码分别处理 */ }
+      }
+
+      // 保留 401001 契约，兼容只认 code 的旧后端/旧前端。
+      if (json.code === 401001) {
         state.loggedIn = false;
         state.csrfToken = null;
         showLoginScreen();
@@ -199,14 +238,16 @@
         return this.request(path, method, body, false);
       }
 
-      // 其它非 2xx 且无 code 的响应同样不能被当成裸 JSON 数据返回。
-      if (!res.ok && json.code === undefined) {
-        throw new Error(json.error || json.message || `请求失败 (HTTP ${res.status})`);
+      if (!res.ok) {
+        const msg = parsed ? (json.error || json.message) : '';
+        throw new Error(msg || `请求失败 (HTTP ${res.status})`);
       }
+
+      // 2xx 但非 JSON：原样返回文本，供 Sub-Store 透传等场景使用。
+      if (!parsed) return text;
 
       // subs-check 原生端点（/api/logs、/api/config、/api/version 等）返回裸 JSON，
       // 不带 {code,message,data} 包裹；这里直接把整个响应交给调用方。
-      // 合并后的新端点继续走下面的 data 解包逻辑。
       if (json.code === undefined) return json;
 
       if (json.code !== 0) {
@@ -304,8 +345,8 @@
         : fluxor.error ? '不可用'
         : String(fluxor.nodes || 0);
       const fluxorLabel = !fluxor.enabled ? 'Fluxor 未配置'
-        : fluxor.error ? ('Fluxor ' + fluxor.error)
-        : ('Fluxor 节点 · ' + (fluxor.providers || 0) + ' 订阅' + (fluxor.version ? ' · v' + utils.escapeHtml(String(fluxor.version)) : ''));
+        : fluxor.error ? ('Fluxor ' + utils.escapeHtml(String(fluxor.error)))
+        : ('Fluxor 节点 · ' + utils.escapeHtml(String(fluxor.providers || 0)) + ' 订阅' + (fluxor.version ? ' · v' + utils.escapeHtml(String(fluxor.version)) : ''));
 
       const statCards = `
         <div class="stat-card" style="--accent-color: var(--color-success);">
@@ -373,12 +414,17 @@
       // 节点概览 — 增强：显示节点类型分布 + 延迟统计
       const byType = nodes.byType || {};
       const typeBadges = Object.entries(byType).slice(0, 8).map(([t, c]) =>
-        `<span class="badge badge-gray">${utils.escapeHtml(t)}: ${c}</span>`
+        `<span class="badge badge-gray">${utils.escapeHtml(t)}: ${utils.escapeHtml(c)}</span>`
       ).join(' ');
-      const delayInfo = nodes.avgDelay != null
-        ? `<div class="text-xs text-muted mt-2">延迟: ${nodes.avgDelay.toFixed(0)}ms 平均 / ${nodes.minDelay.toFixed(0)}ms 最低 / ${nodes.maxDelay.toFixed(0)}ms 最高</div>`
+      // 后端目前只填 Total/ByType/Available，延迟字段恒为 0。统一用 Number 归一，
+      // 避免后端改成字符串时 .toFixed 抛 TypeError 中断整个仪表盘渲染。
+      const avgDelay = Number(nodes.avgDelay);
+      const fmtDelay = v => Number.isFinite(v) ? v.toFixed(0) : '-';
+      const delayInfo = Number.isFinite(avgDelay) && avgDelay > 0
+        ? `<div class="text-xs text-muted mt-2">延迟: ${fmtDelay(avgDelay)}ms 平均 / ${fmtDelay(Number(nodes.minDelay))}ms 最低 / ${fmtDelay(Number(nodes.maxDelay))}ms 最高</div>`
         : '';
-      document.getElementById('node-overview').innerHTML = `
+      const nodeOverview = document.getElementById('node-overview');
+      if (nodeOverview) nodeOverview.innerHTML = `
         <div class="stat-card" style="margin-bottom: 0.8rem; --accent-color: var(--color-accent);">
           <div class="stat-card-row">
             <span class="icon">🌐</span>
@@ -409,29 +455,32 @@
         `;
       }
 
-      // Sub-Store 信息
+      // Sub-Store 信息（透传上游可能是非 JSON 文本，做降级与 null 保护）
+      const substoreInfo = document.getElementById('substore-info');
       try {
         const env = await api.get('/api/substore/api/utils/env');
-        document.getElementById('substore-info').innerHTML = `
+        const envObj = (env && typeof env === 'object') ? env : {};
+        if (substoreInfo) substoreInfo.innerHTML = `
           <div class="stat-card" style="margin-bottom: 0.6rem; --accent-color: var(--color-accent);">
             <div class="stat-card-row">
               <span class="icon">📦</span>
               <div>
-                <div class="num" style="font-size: 1.2rem;">${utils.escapeHtml(env.version || 'N/A')}</div>
+                <div class="num" style="font-size: 1.2rem;">${utils.escapeHtml(envObj.version || 'N/A')}</div>
                 <div class="label">版本</div>
               </div>
             </div>
           </div>
-          <div class="text-xs text-muted mt-2">Backend: ${utils.escapeHtml(env.backend || 'N/A')}</div>
-          <div class="text-xs text-muted">Features: ${utils.escapeHtml(env.feature ? Object.keys(env.feature).join(', ') : '')}</div>
+          <div class="text-xs text-muted mt-2">Backend: ${utils.escapeHtml(envObj.backend || 'N/A')}</div>
+          <div class="text-xs text-muted">Features: ${utils.escapeHtml(envObj.feature ? Object.keys(envObj.feature).join(', ') : '')}</div>
         `;
       } catch {
-        document.getElementById('substore-info').innerHTML = '<div class="text-dim text-sm">Sub-Store 不可达</div>';
+        if (substoreInfo) substoreInfo.innerHTML = '<div class="text-dim text-sm">Sub-Store 不可达</div>';
       }
 
       // 系统信息
       const sysStats = health.stats || {};
-      document.getElementById('sys-info').innerHTML = `
+      const sysInfo = document.getElementById('sys-info');
+      if (sysInfo) sysInfo.innerHTML = `
         <div class="text-xs text-muted space-y-1">
           <div>🕐 运行时长: ${utils.formatUptime(health.uptime || 0)}</div>
           <div>📡 请求数: <span class="font-mono tabular">${sysStats.requests || 0}</span></div>
@@ -445,6 +494,11 @@
         throw e;
       }
       statsEl.innerHTML = utils.errorState('加载失败: ' + e.message, 'loadDashboard');
+      // 其余卡片此前会停在初始骨架屏永久不消失，给一个明确的失败态。
+      ['node-overview', 'source-overview', 'substore-info', 'sys-info'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = '<div class="text-dim text-sm">数据未加载</div>';
+      });
       // 更新状态指示器
       const statusDot = document.getElementById('service-status-dot');
       const statusText = document.getElementById('service-status-text');
@@ -532,7 +586,7 @@
                 <td class="font-medium">${utils.escapeHtml(n.name)}</td>
                 <td><span class="badge badge-gray">${utils.escapeHtml(n.type)}</span></td>
                 <td class="text-xs text-muted">${utils.escapeHtml(n.server)}</td>
-                <td class="text-xs font-mono tabular">${n.port}</td>
+                <td class="text-xs font-mono tabular">${utils.escapeHtml(n.port)}</td>
                 <td>${n.tls ? '<span class="badge badge-green">TLS</span>' : '<span class="badge badge-gray">明文</span>'}</td>
                 <td><span class="badge badge-blue">${utils.escapeHtml(n.network || 'tcp')}</span></td>
               </tr>
@@ -699,18 +753,32 @@
     if (el) el.innerHTML = '';
   }
 
+  // 日志轮询：用递归 setTimeout 取代 setInterval，保证「上一次完成才排下一次」。
+  // 原实现无 in-flight 保护，响应慢于 5s 时请求会不断叠加；页面切走后定时器
+  // 仍在跑。现在后台标签页跳过本轮，并重入时直接排队下一轮。
+  let logRefreshBusy = false;
+
+  async function logRefreshTick() {
+    if (!state.logAutoRefresh) return;
+    if (!document.hidden && !logRefreshBusy) {
+      logRefreshBusy = true;
+      try { await loadLogs(); } finally { logRefreshBusy = false; }
+    }
+    if (state.logAutoRefresh) {
+      state.logRefreshTimer = setTimeout(logRefreshTick, 5000);
+    }
+  }
+
   function toggleLogAutoRefresh() {
     state.logAutoRefresh = !state.logAutoRefresh;
     const checkbox = document.getElementById('auto-refresh-logs');
+    if (checkbox) checkbox.checked = state.logAutoRefresh;
+    if (state.logRefreshTimer) {
+      clearTimeout(state.logRefreshTimer);
+      state.logRefreshTimer = null;
+    }
     if (state.logAutoRefresh) {
-      checkbox.checked = true;
-      state.logRefreshTimer = setInterval(loadLogs, 5000);
-    } else {
-      checkbox.checked = false;
-      if (state.logRefreshTimer) {
-        clearInterval(state.logRefreshTimer);
-        state.logRefreshTimer = null;
-      }
+      state.logRefreshTimer = setTimeout(logRefreshTick, 5000);
     }
   }
 
@@ -736,6 +804,10 @@
 
   // ===== 导航 =====
   function setupNav() {
+    // init() 调一次，登录成功后 restorePanel() 又调一次；nav 位于 .main 之外
+    // 不会被重建，监听器会叠加 → 登录后每次切页发两倍请求。
+    if (setupNav._bound) return;
+    setupNav._bound = true;
     document.querySelectorAll('.nav-link').forEach(a => {
       a.addEventListener('click', (e) => {
         e.preventDefault();

@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -161,29 +163,53 @@ func ReadConfigFile(path string) (string, error) {
 	return string(data), nil
 }
 
-// WriteConfigFile atomically writes a config file using temp file + rename
-func WriteConfigFile(path string, content string) error {
-	tmpPath := path + ".tmp"
+// ConfigFileMu guards the read-modify-write cycle used by the "add / update /
+// delete subscription source" handlers. Without it two concurrent requests
+// can read the same content and the last writer silently discards the other
+// change. It is exported so the app layer can wrap the whole cycle in one
+// critical section while still using ReadConfigFile/WriteConfigFile.
+var ConfigFileMu sync.Mutex
 
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+// writeFileMu 串行化 WriteConfigFile 自身的「临时文件 + rename」序列。
+// ConfigFileMu 保护的是 handler 层的 read-modify-write；本锁让函数在没有
+// 外层锁的调用方处也并发安全（Windows 上并发 rename 到同一目标会
+// 返回 "Access is denied"）。两把锁的获取顺序始终一致，不会死锁。
+var writeFileMu sync.Mutex
+
+// WriteConfigFile atomically writes a config file using a unique temp file +
+// rename. A fixed "path.tmp" name used to be shared by every concurrent
+// writer, so two requests could interleave inside the same temp file.
+// os.CreateTemp also creates the file with 0600 (the config contains
+// github-token / s3-secret-key / webdav-password), instead of the previous
+// world-readable 0644.
+func WriteConfigFile(path string, content string) error {
+	writeFileMu.Lock()
+	defer writeFileMu.Unlock()
+
+	f, err := os.CreateTemp(filepath.Dir(path), ".config-*.tmp")
 	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	defer func() { _ = os.Remove(tmpPath) }() // no-op after a successful rename
+
+	// CreateTemp 在 Unix 上已是 0600，显式声明以免依赖平台默认行为。
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
 		return err
 	}
 	if _, err := f.WriteString(content); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmpPath)
 		return err
 	}
 	if err := f.Sync(); err != nil { // fsync to ensure durability
 		_ = f.Close()
-		_ = os.Remove(tmpPath)
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
 
-	// Atomic rename
 	return os.Rename(tmpPath, path)
 }
 

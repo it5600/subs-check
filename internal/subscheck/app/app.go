@@ -192,8 +192,12 @@ func (app *App) triggerCheck() {
 	defer app.checking.Store(false)
 
 	if err := app.checkProxies(); err != nil {
-		slog.Error(fmt.Sprintf("检测代理失败: %v", err))
-		os.Exit(1)
+		// 一轮检测失败（订阅源全挂、网络临时故障等）不应杀掉整个进程：
+		// Web UI 与 Sub-Store 也在同一进程里，os.Exit 会让管理面板一起消失，
+		// 并被 supervisor 反复重启。记录错误后返回，defer 会复位 checking，
+		// 下一轮 cron/ticker 自动重试。
+		slog.Error(fmt.Sprintf("检测代理失败: %v，本轮跳过，等待下一轮定时检测重试", err))
+		return
 	}
 
 	if app.ticker != nil {

@@ -29,7 +29,7 @@ func Notify(request NotifyRequest) error {
 	}
 
 	// 发送请求
-	resp, err := http.Post(config.GlobalConfig.AppriseApiServer, "application/json", bytes.NewBuffer(body))
+	resp, err := OutboundHTTPClient.Post(config.GlobalConfig.AppriseApiServer, "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		return fmt.Errorf("发送请求失败: %w", err)
 	}

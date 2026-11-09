@@ -248,5 +248,10 @@ func startBackgroundCleanup(app *scapp.SubStoreApp) {
 	for {
 		<-csrfTicker.C
 		middleware.CleanupCSRFTokens()
+		// 1.4.11：过期 Session 此前只在 Get() 时被惰性删除，从未再次访问的
+		// session 会永久驻留。复用同一 ticker 主动回收，避免长跑内存增长。
+		if sessions := app.HandlerApp().Sessions; sessions != nil {
+			sessions.Cleanup()
+		}
 	}
 }

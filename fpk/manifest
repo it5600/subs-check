@@ -1,5 +1,5 @@
 appname               = trim.substore-ui-go
-version               = 1.4.10
+version               = 1.4.11
 display_name          = Sub-Store 管理面板
 desc                  = 订阅节点管理面板，集成 subs-check 节点测活与 Sub-Store 订阅转换服务，单二进制一体化部署。通过飞牛统一网关接入，无需开放安全入口。
 platform              = x86
@@ -13,4 +13,4 @@ desktop_uidir         = ui
 desktop_applaunchname = trim.substore-ui-go.main
 ctl_stop              = true
 checkport             = false
-changelog             = 1.4.10 修复管理面板空白：401 未授权响应体缺少 code 字段，且被前端「裸 JSON 兼容」逻辑误判为成功数据返回，导致登录框永不显示、数据区空白。前端改为按 HTTP 401 判定并拦截所有非 2xx 裸响应，后端 401 同时返回 code=401001（保留 error 字段兼容）。同批纳入订阅源 4xx 永久失效 TTL 熔断（sub-url-fail-ttl，默认 1440 分钟，到期自动重试）及 1.4.9 的 ETA 预估、流媒体检测重试、Fluxor 面板集成、fluxor-delay-* 配置项
+changelog             = 1.4.11 稳定性与交互优化（保持全部接口与数据格式兼容）：检测失败不再退出进程，Web UI 不会被拖垮；出站 HTTP 统一 15s 超时避免检测主循环挂死；修复 gzip 破坏 Range/304 响应并跳过图片字体压缩；配置文件原子写改为唯一临时文件+0600 且串行化，修复并发增删订阅源丢失更新；检测时间与访问日志状态改为原子访问；分页页码溢出不再 panic；API Key 不再明文写入日志；网关 socket 模式禁用 pprof；Fluxor 延迟测试参数转义；fsnotify 不可用时降级 5s 轮询；前端 401 判定前置并容忍非 JSON 响应、30s 超时、PATCH 携带 CSRF、导航监听幂等、日志轮询防重入、XSS 转义补齐。1.4.10 的面板空白修复与订阅源 4xx TTL 熔断、1.4.9 的 ETA 预估与 Fluxor 集成一并保留

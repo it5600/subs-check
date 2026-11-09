@@ -697,7 +697,12 @@
         }
 
         function escapeHtml(str) {
-            return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            // 与 www/app.js 的 utils.escapeHtml 保持一致：补齐引号转义，
+            // 否则日志内容一旦被拼进 HTML 属性就能闭合引号注入；顺带做 null 保护。
+            if (str == null) return '';
+            return String(str).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
         }
 
         // 为日志添加颜色

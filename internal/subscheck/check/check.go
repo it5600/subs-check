@@ -224,13 +224,32 @@ func installPhaseCancel(cancel context.CancelFunc) func() {
 
 var Bucket *ratelimit.Bucket
 
-// CheckStartTime / CheckEndTime / CheckDuration 记录最近一轮检测的起止时间，
-// 供 /api/status 的 elapsed/duration 字段与 ETA 估算使用。
+// 检测轮次时间状态。此前是包级 time.Time / time.Duration，由检测循环写、
+// /api/status 每 3 秒轮询时读，构成 data race（time.Time 是 3 个字的 struct，
+// 撕裂读写会让 time.Since 算出荒谬值）。改为 UnixNano + atomic.Int64，
+// 读写都是单条原子指令；对外只暴露语义化函数，字段名保持不变。
 var (
-	CheckStartTime time.Time
-	CheckEndTime   time.Time
-	CheckDuration  time.Duration
+	checkStartNano    atomic.Int64 // 0 = 尚未开始过检测
+	checkEndNano      atomic.Int64
+	checkDurationNano atomic.Int64
 )
+
+func SetCheckStart(t time.Time) { checkStartNano.Store(t.UnixNano()) }
+func CheckStartNano() int64     { return checkStartNano.Load() }
+func SetCheckEnd(t time.Time)   { checkEndNano.Store(t.UnixNano()) }
+func CheckEndNano() int64       { return checkEndNano.Load() }
+
+func SetCheckDuration(d time.Duration) { checkDurationNano.Store(int64(d)) }
+func CheckDuration() time.Duration     { return time.Duration(checkDurationNano.Load()) }
+
+// CheckElapsed 返回自本轮检测开始的时长；尚未开始时返回 0。
+func CheckElapsed() time.Duration {
+	start := checkStartNano.Load()
+	if start <= 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, start))
+}
 
 // effectiveConcurrency 计算阶段实际并发数
 func effectiveConcurrency(phaseConcurrency, fallback, itemCount int) int {
@@ -384,7 +403,7 @@ func (pc *ProxyChecker) run(proxies []map[string]any, subTotals map[string]int) 
 
 	// ETA 预估：每 500ms 快照进度，用滑动窗口实时速率 + 历史速率融合估算剩余时间。
 	// ctx 取消时做最后一次估算供 /api/status 读取，goroutine 随整条流水线一起退出。
-	CheckStartTime = time.Now()
+	SetCheckStart(time.Now())
 	ResetETA()
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -508,12 +527,13 @@ func (pc *ProxyChecker) run(proxies []map[string]any, subTotals map[string]int) 
 
 	pc.checkSubscriptionSuccessRate(subTotals)
 
-	CheckEndTime = time.Now()
-	CheckDuration = time.Since(CheckStartTime)
+	SetCheckEnd(time.Now())
+	lastDuration := CheckElapsed()
+	SetCheckDuration(lastDuration)
 	ETASeconds.Store(0) // 标记本轮结束：前端看到 eta=0 即表示完成/空闲
-	if CheckDuration > 0 {
+	if lastDuration > 0 {
 		// 记录本轮平均速率，供下一轮冷启动前 3 秒的融合估算使用
-		SetHistoricalRate(float64(Progress.Load()) / CheckDuration.Seconds())
+		SetHistoricalRate(float64(Progress.Load()) / lastDuration.Seconds())
 	}
 
 	// 一轮结束后把临时对象还给操作系统，避免常驻内存停在峰值

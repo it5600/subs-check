@@ -13,57 +13,94 @@ import (
 	"net/http"
 )
 
-// gzipWriter wraps http.ResponseWriter to compress output.
-type gzipWriter struct {
+// gzipDecisionWriter defers the compression decision until the first
+// WriteHeader/Write, i.e. after the handler has set Content-Type and status.
+//
+// The previous implementation read Content-Type *before* calling next, when
+// the header map was still empty, so shouldCompress("") always returned true:
+// images/fonts were compressed for nothing, and http.ServeContent responses
+// kept a stale Content-Length while the body was gzip-encoded (Range/206 and
+// conditional/304 replies were corrupted). Deciding lazily fixes all of that
+// without changing the bytes the client sees after decompression.
+type gzipDecisionWriter struct {
 	http.ResponseWriter
-	gz *gzip.Writer
-	// status records the HTTP status code for the wrapped writer.
-	status int
+	gz      *gzip.Writer
+	decided bool
 }
 
-func (gw *gzipWriter) WriteHeader(code int) {
-	gw.status = code
+func (gw *gzipDecisionWriter) WriteHeader(code int) {
+	if gw.decided {
+		return
+	}
+	gw.decided = true
+
+	// Statuses with no body, conditional 304 and partial 206 must keep their
+	// Content-Length / Content-Range semantics byte-exact.
+	if code < 200 || code == http.StatusNoContent ||
+		code == http.StatusNotModified || code == http.StatusPartialContent ||
+		!shouldCompress(gw.Header().Get("Content-Type")) {
+		gw.ResponseWriter.WriteHeader(code)
+		return
+	}
+
+	gw.Header().Set("Content-Encoding", "gzip")
+	gw.Header().Add("Vary", "Accept-Encoding")
+	gw.Header().Del("Content-Length") // compressed length differs from the original
+	gw.gz = gzip.NewWriter(gw.ResponseWriter)
 	gw.ResponseWriter.WriteHeader(code)
 }
 
-func (gw *gzipWriter) Write(b []byte) (int, error) {
-	if gw.status == 0 {
-		gw.status = http.StatusOK
+func (gw *gzipDecisionWriter) Write(b []byte) (int, error) {
+	if !gw.decided {
+		gw.WriteHeader(http.StatusOK)
 	}
-	return gw.gz.Write(b)
-}
-
-func (gw *gzipWriter) Close() error {
-	return gw.gz.Close()
+	if gw.gz != nil {
+		return gw.gz.Write(b)
+	}
+	return gw.ResponseWriter.Write(b)
 }
 
 // Flush implements http.Flusher for streaming responses through gzip.
-func (gw *gzipWriter) Flush() {
-	if f, ok := gw.ResponseWriter.(http.Flusher); ok {
+func (gw *gzipDecisionWriter) Flush() {
+	if !gw.decided {
+		gw.WriteHeader(http.StatusOK)
+	}
+	if gw.gz != nil {
 		_ = gw.gz.Flush()
+	}
+	if f, ok := gw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
+func (gw *gzipDecisionWriter) Close() error {
+	if gw.gz != nil {
+		return gw.gz.Close()
+	}
+	return nil
+}
+
 // GzipCompress wraps a handler with gzip compression.
-// Compresses responses only when the client accepts gzip and the
-// Content-Type is worth compressing (text/JSON/HTML/CSS/JS).
+// Compresses responses only when the client accepts gzip and the actual
+// response Content-Type is worth compressing (text/JSON/HTML/CSS/JS).
 func GzipCompress(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !acceptsGzip(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		ct := w.Header().Get("Content-Type")
-		if !shouldCompress(ct) {
-			next.ServeHTTP(w, r)
-			return
-		}
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Add("Vary", "Accept-Encoding")
-		gz := gzip.NewWriter(w)
-		defer func() { _ = gz.Close() }()
-		next.ServeHTTP(&gzipWriter{ResponseWriter: w, gz: gz}, r)
+		gw := &gzipDecisionWriter{ResponseWriter: w}
+		defer func() {
+			if !gw.decided {
+				// handler 完全没写任何东西：沿用 net/http 原生的「200 + 空体」
+				// 语义，不要为一个空响应生成 gzip 流、也不要误加 Content-Encoding。
+				gw.decided = true
+				gw.ResponseWriter.WriteHeader(http.StatusOK)
+				return
+			}
+			_ = gw.Close()
+		}()
+		next.ServeHTTP(gw, r)
 	})
 }
 

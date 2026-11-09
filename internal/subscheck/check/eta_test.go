@@ -8,11 +8,12 @@ import (
 )
 
 // saveETAState 保存/恢复 ETA 用到的包级全局状态，防止测试间互相污染。
+// 1.4.11 起检测时间改为 atomic.Int64 存储，这里直接存取包内原子变量。
 func saveETAState(t *testing.T) {
 	t.Helper()
 	oldTotal, oldProgress, oldAvailable := ProxyCount.Load(), Progress.Load(), Available.Load()
 	oldCollector := CollectorPassed.Load()
-	oldStart, oldEnd, oldDur := CheckStartTime, CheckEndTime, CheckDuration
+	oldStart, oldEnd, oldDur := checkStartNano.Load(), checkEndNano.Load(), checkDurationNano.Load()
 	oldETA := ETASeconds.Load()
 	oldLimit := config.GlobalConfig.SuccessLimit
 	t.Cleanup(func() {
@@ -20,7 +21,9 @@ func saveETAState(t *testing.T) {
 		Progress.Store(oldProgress)
 		Available.Store(oldAvailable)
 		CollectorPassed.Store(oldCollector)
-		CheckStartTime, CheckEndTime, CheckDuration = oldStart, oldEnd, oldDur
+		checkStartNano.Store(oldStart)
+		checkEndNano.Store(oldEnd)
+		checkDurationNano.Store(oldDur)
 		ETASeconds.Store(oldETA)
 		config.GlobalConfig.SuccessLimit = oldLimit
 		SetHistoricalRate(0)
@@ -33,7 +36,7 @@ func saveETAState(t *testing.T) {
 func TestUpdateETA_IdleAndComplete(t *testing.T) {
 	saveETAState(t)
 	config.GlobalConfig.SuccessLimit = 0
-	CheckStartTime = time.Now().Add(-10 * time.Second)
+	SetCheckStart(time.Now().Add(-10 * time.Second))
 
 	// 空闲：总数为 0
 	ProxyCount.Store(0)
@@ -57,7 +60,7 @@ func TestUpdateETA_Calculating(t *testing.T) {
 	config.GlobalConfig.SuccessLimit = 0
 	ProxyCount.Store(100)
 	Progress.Store(10)
-	CheckStartTime = time.Now() // elapsed < 3s → 计算中
+	SetCheckStart(time.Now()) // elapsed < 3s → 计算中
 	UpdateETA()
 	if got := ETASeconds.Load(); got != -1 {
 		t.Fatalf("启动不足 3 秒应返回 -1(计算中), got %d", got)
@@ -72,7 +75,7 @@ func TestUpdateETA_SuccessLimitProjection(t *testing.T) {
 	ProxyCount.Store(100)
 	Progress.Store(20)
 	CollectorPassed.Store(10)
-	CheckStartTime = time.Now().Add(-10 * time.Second)
+	SetCheckStart(time.Now().Add(-10 * time.Second))
 
 	UpdateETA()
 	got := ETASeconds.Load()
@@ -90,7 +93,7 @@ func TestUpdateETA_UsesCollectorPassedNotAvailable(t *testing.T) {
 	Progress.Store(4982)
 	Available.Store(245)      // 测活通过数，远超 SuccessLimit
 	CollectorPassed.Store(42) // collector 最终通过数，尚未达标
-	CheckStartTime = time.Now().Add(-201 * time.Second)
+	SetCheckStart(time.Now().Add(-201 * time.Second))
 
 	UpdateETA()
 	if got := ETASeconds.Load(); got <= 0 {
@@ -106,7 +109,7 @@ func TestUpdateETA_ClampsToRemainingNodes(t *testing.T) {
 	ProxyCount.Store(1000)
 	Progress.Store(900)      // 物理剩余 100 个节点
 	CollectorPassed.Store(1) // 折算值 (100-1)*900 = 89100，明显不合理
-	CheckStartTime = time.Now().Add(-100 * time.Second)
+	SetCheckStart(time.Now().Add(-100 * time.Second))
 
 	UpdateETA()
 	// 速率兜底 = 900/100 = 9 节点/秒 → 钳制后 ETA ≈ ceil(100/9) = 12 秒
@@ -122,7 +125,7 @@ func TestUpdateETA_HistoricalRateColdStart(t *testing.T) {
 	SetHistoricalRate(5) // 上一轮 5 节点/秒
 	ProxyCount.Store(100)
 	Progress.Store(0) // 冷启动：还没有实时速率
-	CheckStartTime = time.Now().Add(-10 * time.Second)
+	SetCheckStart(time.Now().Add(-10 * time.Second))
 
 	UpdateETA()
 	got := ETASeconds.Load()
@@ -150,5 +153,32 @@ func TestSnapshotRate_TrimsOldPoints(t *testing.T) {
 	}
 	if rateHist[0].n != 2 {
 		t.Fatalf("裁剪后首个点应为 n=2, got %d", rateHist[0].n)
+	}
+}
+
+// 1.4.11 回归：检测时间状态必须能安全地被检测循环写、被 /api/status 读。
+func TestCheckTiming_AtomicAccessors(t *testing.T) {
+	saveETAState(t)
+	checkStartNano.Store(0)
+	if got := CheckElapsed(); got != 0 {
+		t.Fatalf("尚未开始检测时 elapsed 应为 0, got %v", got)
+	}
+
+	start := time.Now().Add(-2 * time.Second)
+	SetCheckStart(start)
+	if CheckStartNano() != start.UnixNano() {
+		t.Fatal("SetCheckStart 未正确写入")
+	}
+	if elapsed := CheckElapsed(); elapsed < time.Second || elapsed > 5*time.Second {
+		t.Fatalf("elapsed 明显不合理: %v", elapsed)
+	}
+
+	SetCheckDuration(3 * time.Second)
+	if CheckDuration() != 3*time.Second {
+		t.Fatalf("CheckDuration 应为 3s, got %v", CheckDuration())
+	}
+	SetCheckEnd(time.Now())
+	if CheckEndNano() <= 0 {
+		t.Fatal("SetCheckEnd 未正确写入")
 	}
 }

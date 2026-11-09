@@ -63,7 +63,7 @@ func UpdateSubs() {
 		return
 	}
 
-	version, err := getVersion(http.DefaultClient)
+	version, err := getVersion(OutboundHTTPClient)
 	if err != nil {
 		slog.Error(fmt.Sprintf("获取版本失败: %v", err))
 		return
@@ -71,13 +71,13 @@ func UpdateSubs() {
 
 	slog.Info(fmt.Sprintf("当前Mihomo版本: %s", version))
 
-	names, err := getNeedUpdateNames(http.DefaultClient)
+	names, err := getNeedUpdateNames(OutboundHTTPClient)
 	if err != nil {
 		slog.Error(fmt.Sprintf("获取需要更新的订阅失败: %v", err))
 		return
 	}
 
-	if err := updateSubs(http.DefaultClient, names); err != nil {
+	if err := updateSubs(OutboundHTTPClient, names); err != nil {
 		slog.Error(fmt.Sprintf("更新订阅失败: %v", err))
 		return
 	}

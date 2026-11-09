@@ -171,7 +171,7 @@ func UpdateSubStore(yamlData []byte) error {
 	return nil
 }
 func checkSub() error {
-	resp, err := http.Get(fmt.Sprintf("%s/api/sub/%s", BaseURL, SubName))
+	resp, err := OutboundHTTPClient.Get(fmt.Sprintf("%s/api/sub/%s", BaseURL, SubName))
 	if err != nil {
 		return err
 	}
@@ -209,7 +209,7 @@ func createSub(data []byte) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(fmt.Sprintf("%s/api/subs", BaseURL), "application/json", bytes.NewBuffer(json))
+	resp, err := OutboundHTTPClient.Post(fmt.Sprintf("%s/api/subs", BaseURL), "application/json", bytes.NewBuffer(json))
 	if err != nil {
 		return err
 	}
@@ -234,7 +234,7 @@ func updateSub(data []byte) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := OutboundHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -246,7 +246,7 @@ func updateSub(data []byte) error {
 }
 
 func checkfile() error {
-	resp, err := http.Get(fmt.Sprintf("%s/api/wholeFile/%s", BaseURL, MihomoName))
+	resp, err := OutboundHTTPClient.Get(fmt.Sprintf("%s/api/wholeFile/%s", BaseURL, MihomoName))
 	if err != nil {
 		return err
 	}
@@ -290,7 +290,7 @@ func createfile() error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(fmt.Sprintf("%s/api/files", BaseURL), "application/json", bytes.NewBuffer(json))
+	resp, err := OutboundHTTPClient.Post(fmt.Sprintf("%s/api/files", BaseURL), "application/json", bytes.NewBuffer(json))
 	if err != nil {
 		return err
 	}
@@ -304,7 +304,7 @@ func createfile() error {
 func updatefile() error {
 	// 把现有 file 整个拉出来，只改我们自己的 Script Operator 的覆写 URL，
 	// 再用 PATCH (浅合并) 只发回 process。这样用户加的其它算子和文件的其它字段都保留。
-	resp, err := http.Get(fmt.Sprintf("%s/api/wholeFile/%s", BaseURL, MihomoName))
+	resp, err := OutboundHTTPClient.Get(fmt.Sprintf("%s/api/wholeFile/%s", BaseURL, MihomoName))
 	if err != nil {
 		return err
 	}
@@ -387,7 +387,7 @@ func updatefile() error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = OutboundHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

@@ -67,7 +67,7 @@ func UpdateETA() {
 		ETASeconds.Store(0)
 		return
 	}
-	elapsed := time.Since(CheckStartTime).Seconds()
+	elapsed := CheckElapsed().Seconds()
 	if elapsed < 3 {
 		ETASeconds.Store(-1)
 		return
